@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Text;
 
 class Program
 {
@@ -7,25 +8,19 @@ class Program
     static string? FindExecutableInPath(string cmd)
     {
         var pathEnv = Environment.GetEnvironmentVariable("PATH");
-        if (string.IsNullOrEmpty(pathEnv))
-            return null;
+        if (string.IsNullOrEmpty(pathEnv)) return null;
 
         var directories = pathEnv.Split(Path.PathSeparator);
 
         foreach (var dir in directories)
         {
-            if (string.IsNullOrEmpty(dir))
-                continue;
+            if (string.IsNullOrEmpty(dir)) continue;
 
             try
             {
                 var fullPath = Path.Combine(dir, cmd);
-
-                if (!File.Exists(fullPath))
-                    continue;
-
-                if (IsExecutable(fullPath))
-                    return fullPath;
+                if (!File.Exists(fullPath)) continue;
+                if (IsExecutable(fullPath)) return fullPath;
             }
             catch (Exception)
             {
@@ -41,14 +36,13 @@ class Program
         try
         {
             var fileInfo = new FileInfo(filePath);
-
-            if (fileInfo.Attributes.HasFlag(FileAttributes.Directory))
-                return false;
+            if (fileInfo.Attributes.HasFlag(FileAttributes.Directory)) return false;
 
             if (!OperatingSystem.IsWindows())
             {
                 var unixAttrs = fileInfo.UnixFileMode;
-                return (unixAttrs & (UnixFileMode.UserExecute | UnixFileMode.GroupExecute | UnixFileMode.OtherExecute)) != 0;
+                return (unixAttrs &
+                        (UnixFileMode.UserExecute | UnixFileMode.GroupExecute | UnixFileMode.OtherExecute)) != 0;
             }
             else
             {
@@ -62,24 +56,104 @@ class Program
         }
     }
 
+    // ── RedirectionInfo ───────────────────────────────────────────────────────
+    // CHANGED: Added StderrAppend flag, mirroring StdoutAppend.
+    class RedirectionInfo
+    {
+        public string? StdoutFile { get; set; }
+        public bool StdoutAppend { get; set; } // true = >>,  false = >
+        public string? StderrFile { get; set; }
+        public bool StderrAppend { get; set; } // true = 2>>, false = 2>
+    }
+
     static bool IsBuiltin(string cmd)
     {
         return Array.Exists(Builtins, element => element == cmd);
     }
 
-    // ── ExecuteExternalProgram ────────────────────────────────────────────────
-    // FIX: argv[0] must be the bare command name (e.g. "custom_exe_1234"),
-    // NOT the full path (e.g. "/tmp/dog/custom_exe_1234").
-    //
-    // In .NET, ProcessStartInfo.FileName becomes argv[0] automatically,
-    // so setting FileName to the full path caused the wrong argv[0].
-    //
-    // The solution: run through /bin/sh using "exec -a <name> -- <fullpath> <args>".
-    //   -a <name>   explicitly sets argv[0] to the bare command name
-    //   --          separates the argv[0] override from the path and args
-    // This matches real Unix shell behaviour where argv[0] is always the name
-    // the user typed, not the resolved path.
-    static void ExecuteExternalProgram(string cmd, string[] args)
+    // ── ParseRedirection ──────────────────────────────────────────────────────
+    // CHANGED: Recognises 2>> in addition to all previous operators.
+    static (string[], RedirectionInfo) ParseRedirection(string[] tokens)
+    {
+        var cleanedTokens = new List<string>();
+        var redirectInfo = new RedirectionInfo();
+
+        for (int i = 0; i < tokens.Length; i++)
+        {
+            string token = tokens[i];
+
+            if ((token == ">>" || token == "1>>") && i + 1 < tokens.Length)
+            {
+                redirectInfo.StdoutFile = tokens[i + 1];
+                redirectInfo.StdoutAppend = true;
+                i++;
+            }
+            else if ((token == ">" || token == "1>") && i + 1 < tokens.Length)
+            {
+                redirectInfo.StdoutFile = tokens[i + 1];
+                redirectInfo.StdoutAppend = false;
+                i++;
+            }
+            // Append stderr: 2>>
+            else if (token == "2>>" && i + 1 < tokens.Length)
+            {
+                redirectInfo.StderrFile = tokens[i + 1];
+                redirectInfo.StderrAppend = true; // preserve existing content
+                i++;
+            }
+            // Overwrite stderr: 2>
+            else if (token == "2>" && i + 1 < tokens.Length)
+            {
+                redirectInfo.StderrFile = tokens[i + 1];
+                redirectInfo.StderrAppend = false; // truncate existing content
+                i++;
+            }
+            else
+            {
+                cleanedTokens.Add(token);
+            }
+        }
+
+        return (cleanedTokens.ToArray(), redirectInfo);
+    }
+
+    // ── WriteStdout ───────────────────────────────────────────────────────────
+    static void WriteStdout(string text, RedirectionInfo redirect)
+    {
+        if (!string.IsNullOrEmpty(redirect.StdoutFile))
+        {
+            try
+            {
+                var mode = redirect.StdoutAppend ? FileMode.Append : FileMode.Create;
+                using var sw = new StreamWriter(new FileStream(redirect.StdoutFile, mode, FileAccess.Write));
+                sw.WriteLine(text);
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine($"Error writing to file: {ex.Message}");
+            }
+        }
+        else
+        {
+            Console.WriteLine(text);
+        }
+    }
+
+    // Always create a redirect target file even if nothing is written to it.
+    static void EnsureFileCreated(string? path)
+    {
+        if (string.IsNullOrEmpty(path)) return;
+        try
+        {
+            using var _ = new FileStream(path, FileMode.OpenOrCreate, FileAccess.Write);
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"Error creating redirect file: {ex.Message}");
+        }
+    }
+
+    static void ExecuteExternalProgram(string cmd, string[] args, RedirectionInfo? redirectInfo = null)
     {
         var execPath = FindExecutableInPath(cmd);
         if (string.IsNullOrEmpty(execPath))
@@ -90,32 +164,37 @@ class Program
 
         try
         {
-            // Shell-escape the command name and path to handle spaces/special chars.
-            string escapedCmd      = ShellEscape(cmd);
-            string escapedExecPath = ShellEscape(execPath);
+            var sb = new StringBuilder();
+            sb.Append("exec -a ");
+            sb.Append(ShellEscape(cmd));
+            sb.Append(" -- ");
+            sb.Append(ShellEscape(execPath));
+            foreach (var arg in args)
+            {
+                sb.Append(' ');
+                sb.Append(ShellEscape(arg));
+            }
 
-            // Build the argument string for the child process.
-            // Each argument is individually shell-escaped and joined with spaces.
-            string argsStr = args.Length > 0
-                ? " " + string.Join(" ", Array.ConvertAll(args, ShellEscape))
-                : string.Empty;
+            if (redirectInfo != null && !string.IsNullOrEmpty(redirectInfo.StdoutFile))
+            {
+                sb.Append(redirectInfo.StdoutAppend ? " >> " : " > ");
+                sb.Append(ShellEscape(redirectInfo.StdoutFile));
+            }
 
-            // exec -a sets argv[0]; -- prevents the path from being mistaken
-            // for an option; the remaining tokens are argv[1], argv[2], ...
-            string shellCommand = $"exec -a {escapedCmd} -- {escapedExecPath}{argsStr}";
+            // CHANGED: pass 2>> or 2> to the underlying shell based on StderrAppend
+            if (redirectInfo != null && !string.IsNullOrEmpty(redirectInfo.StderrFile))
+            {
+                sb.Append(redirectInfo.StderrAppend ? " 2>> " : " 2> ");
+                sb.Append(ShellEscape(redirectInfo.StderrFile));
+            }
 
             var process = new Process
             {
-                StartInfo = new ProcessStartInfo
-                {
-                    FileName               = "/bin/sh",
-                    Arguments              = $"-c \"{shellCommand}\"",
-                    UseShellExecute        = false,
-                    RedirectStandardInput  = false,
-                    RedirectStandardOutput = false,
-                    RedirectStandardError  = false,
-                }
+                StartInfo = new ProcessStartInfo { FileName = "/bin/sh", UseShellExecute = false, }
             };
+
+            process.StartInfo.ArgumentList.Add("-c");
+            process.StartInfo.ArgumentList.Add(sb.ToString());
 
             process.Start();
             process.WaitForExit();
@@ -126,11 +205,78 @@ class Program
         }
     }
 
-    // Wraps a string in single quotes and escapes any embedded single quotes.
-    // This is the standard POSIX shell escaping technique.
     static string ShellEscape(string s)
     {
         return "'" + s.Replace("'", "'\\''") + "'";
+    }
+
+    static string[] ParseCommandLine(string input)
+    {
+        var tokens = new List<string>();
+        var currentToken = new StringBuilder();
+        bool inSingleQuotes = false;
+        bool inDoubleQuotes = false;
+
+        for (int i = 0; i < input.Length; i++)
+        {
+            char c = input[i];
+
+            if (c == '\\' && inDoubleQuotes)
+            {
+                if (i + 1 < input.Length)
+                {
+                    char next = input[i + 1];
+                    if (next == '"' || next == '\\' || next == '$' || next == '`' || next == '\n')
+                    {
+                        i++;
+                        if (next != '\n') currentToken.Append(next);
+                    }
+                    else
+                    {
+                        currentToken.Append(c);
+                    }
+                }
+                else
+                {
+                    currentToken.Append(c);
+                }
+            }
+            else if (c == '\\' && !inSingleQuotes && !inDoubleQuotes)
+            {
+                if (i + 1 < input.Length)
+                {
+                    i++;
+                    currentToken.Append(input[i]);
+                }
+                else
+                {
+                    currentToken.Append(c);
+                }
+            }
+            else if (c == '\'' && !inDoubleQuotes)
+            {
+                inSingleQuotes = !inSingleQuotes;
+            }
+            else if (c == '"' && !inSingleQuotes)
+            {
+                inDoubleQuotes = !inDoubleQuotes;
+            }
+            else if (c == ' ' && !inSingleQuotes && !inDoubleQuotes)
+            {
+                if (currentToken.Length > 0)
+                {
+                    tokens.Add(currentToken.ToString());
+                    currentToken.Clear();
+                }
+            }
+            else
+            {
+                currentToken.Append(c);
+            }
+        }
+
+        if (currentToken.Length > 0) tokens.Add(currentToken.ToString());
+        return tokens.ToArray();
     }
 
     static void Main()
@@ -140,69 +286,72 @@ class Program
             Console.Write("$ ");
 
             var input = Console.ReadLine();
-            if (input == null)
-                break;
+            if (input == null) break;
 
-            var parts = input.Split(' ', StringSplitOptions.RemoveEmptyEntries);
-            if (parts.Length == 0)
-                continue;
+            var parts = ParseCommandLine(input);
+            if (parts.Length == 0) continue;
 
-            var cmd = parts[0];
+            var (cleanedParts, redirectInfo) = ParseRedirection(parts);
+            if (cleanedParts.Length == 0) continue;
 
-            if (cmd == "exit")
-                break;
+            var cmd = cleanedParts[0];
+
+            if (cmd == "exit") break;
 
             if (cmd == "echo")
             {
-                if (parts.Length == 1)
-                    Console.WriteLine();
-                else
-                    Console.WriteLine(string.Join(" ", parts, 1, parts.Length - 1));
+                string output = cleanedParts.Length == 1
+                    ? ""
+                    : string.Join(" ", cleanedParts, 1, cleanedParts.Length - 1);
+
+                WriteStdout(output, redirectInfo);
+                // echo never produces stderr — just ensure the file exists if specified
+                EnsureFileCreated(redirectInfo.StderrFile);
                 continue;
             }
 
             if (cmd == "type")
             {
-                if (parts.Length < 2)
+                if (cleanedParts.Length < 2)
                 {
                     Console.WriteLine("type: missing operand");
                     continue;
                 }
 
-                var targetCmd = parts[1];
+                var targetCmd = cleanedParts[1];
+                string typeOutput;
                 if (IsBuiltin(targetCmd))
-                {
-                    Console.WriteLine($"{targetCmd} is a shell builtin");
-                }
+                    typeOutput = $"{targetCmd} is a shell builtin";
                 else
                 {
                     var execPath = FindExecutableInPath(targetCmd);
-                    if (!string.IsNullOrEmpty(execPath))
-                        Console.WriteLine($"{targetCmd} is {execPath}");
-                    else
-                        Console.WriteLine($"{targetCmd}: not found");
+                    typeOutput = !string.IsNullOrEmpty(execPath)
+                        ? $"{targetCmd} is {execPath}"
+                        : $"{targetCmd}: not found";
                 }
+
+                WriteStdout(typeOutput, redirectInfo);
+                EnsureFileCreated(redirectInfo.StderrFile);
                 continue;
             }
 
             if (cmd == "pwd")
             {
-                Console.WriteLine(Directory.GetCurrentDirectory());
+                WriteStdout(Directory.GetCurrentDirectory(), redirectInfo);
+                EnsureFileCreated(redirectInfo.StderrFile);
                 continue;
             }
 
             if (cmd == "cd")
             {
-                if (parts.Length < 2)
+                if (cleanedParts.Length < 2)
                 {
-                    // cd without arguments - could go to home, but for now just skip
                     Console.WriteLine("cd: missing operand");
                     continue;
                 }
 
-                var targetDir = parts[1];
+                var targetDir = cleanedParts[1];
 
-                // Handle ~ (home directory)
                 if (targetDir == "~" || targetDir.StartsWith("~/"))
                 {
                     var homeDir = Environment.GetEnvironmentVariable("HOME");
@@ -212,16 +361,12 @@ class Program
                         continue;
                     }
 
-                    // Replace ~ with home directory path
-                    if (targetDir == "~")
-                        targetDir = homeDir;
-                    else
-                        targetDir = homeDir + targetDir.Substring(1); // Replace ~ with home path
+                    targetDir = targetDir == "~" ? homeDir : homeDir + targetDir.Substring(1);
                 }
 
                 if (!Directory.Exists(targetDir))
                 {
-                    Console.WriteLine($"cd: {parts[1]}: No such file or directory");
+                    Console.WriteLine($"cd: {cleanedParts[1]}: No such file or directory");
                     continue;
                 }
 
@@ -231,14 +376,15 @@ class Program
                 }
                 catch (Exception ex)
                 {
-                    Console.WriteLine($"cd: {parts[1]}: {ex.Message}");
+                    Console.WriteLine($"cd: {cleanedParts[1]}: {ex.Message}");
                 }
+
                 continue;
             }
 
             // External program
-            var remainingArgs = parts.Length > 1 ? parts[1..] : Array.Empty<string>();
-            ExecuteExternalProgram(cmd, remainingArgs);
+            var remainingArgs = cleanedParts.Length > 1 ? cleanedParts[1..] : Array.Empty<string>();
+            ExecuteExternalProgram(cmd, remainingArgs, redirectInfo);
         }
     }
 }
