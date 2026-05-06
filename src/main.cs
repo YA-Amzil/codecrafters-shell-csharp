@@ -4,37 +4,173 @@ using ReadLine;
 
 internal class Program
 {
-    // Supported shell built-in commands.
-    private static readonly string[] Builtins = { "echo", "exit", "type", "pwd", "cd" };
+    // ========================================================================
+    //  REGION: Builtins + History
+    // ========================================================================
 
-    // ------------------------------------------------------------------------
-    // Autocompletion (builtins + executables, with LCP logic)
-    // ------------------------------------------------------------------------
+    #region Builtins
+
+    private static readonly string[] Builtins = { "echo", "exit", "type", "pwd", "cd", "history" };
+
+    private static readonly List<string> CommandHistory = new();
+    private static int HistoryAppendCursor = 0;
+
+    private static bool IsBuiltin(string cmd) => Builtins.Contains(cmd);
+
+    private static void AddToHistory(string entry)
+    {
+        // Never store empty lines
+        if (string.IsNullOrWhiteSpace(entry))
+            return;
+
+        CommandHistory.Add(entry);
+        ReadLine.ReadLine.Context.History.Add(entry);
+    }
+
+    private static void LoadHistoryFromFile(string path)
+    {
+        try
+        {
+            foreach (var line in File.ReadLines(path))
+            {
+                if (!string.IsNullOrWhiteSpace(line))
+                    AddToHistory(line);
+            }
+
+            HistoryAppendCursor = CommandHistory.Count;
+        }
+        catch
+        {
+        }
+    }
+
+    private static void WriteHistoryToFile(string path)
+    {
+        try
+        {
+            using var sw = new StreamWriter(path, false, new UTF8Encoding(false));
+
+            foreach (var line in CommandHistory)
+                sw.WriteLine(line);
+        }
+        catch
+        {
+        }
+    }
+
+    private static void AppendHistoryToFile(string path)
+    {
+        try
+        {
+            using var sw = new StreamWriter(path, true, new UTF8Encoding(false));
+
+            for (int i = HistoryAppendCursor; i < CommandHistory.Count; i++)
+                sw.WriteLine(CommandHistory[i]);
+
+            HistoryAppendCursor = CommandHistory.Count;
+        }
+        catch
+        {
+        }
+    }
+
+    private static void RunBuiltinToWriter(string[] parts, TextWriter output)
+    {
+        string cmd = parts[0];
+
+        switch (cmd)
+        {
+            case "echo":
+                output.WriteLine(parts.Length > 1 ? string.Join(" ", parts.Skip(1)) : "");
+                break;
+
+            case "pwd":
+                output.WriteLine(Directory.GetCurrentDirectory());
+                break;
+
+            case "type":
+                if (parts.Length < 2)
+                {
+                    output.WriteLine("type: missing operand");
+                    return;
+                }
+
+                string target = parts[1];
+                if (IsBuiltin(target))
+                    output.WriteLine($"{target} is a shell builtin");
+                else if (FindExecutableInPath(target) is string p)
+                    output.WriteLine($"{target} is {p}");
+                else
+                    output.WriteLine($"{target}: not found");
+                break;
+
+            case "history":
+                HandleHistoryBuiltin(parts, output);
+                break;
+
+            case "cd":
+                // cd inside pipelines does nothing
+                break;
+        }
+    }
+
+    private static void HandleHistoryBuiltin(string[] parts, TextWriter output)
+    {
+        if (parts.Length > 2 && parts[1] == "-a")
+        {
+            AppendHistoryToFile(parts[2]);
+            return;
+        }
+
+        if (parts.Length > 2 && parts[1] == "-w")
+        {
+            WriteHistoryToFile(parts[2]);
+            return;
+        }
+
+        if (parts.Length > 2 && parts[1] == "-r")
+        {
+            LoadHistoryFromFile(parts[2]);
+            return;
+        }
+
+        int limit = CommandHistory.Count;
+        if (parts.Length > 1 && int.TryParse(parts[1], out int n) && n > 0)
+            limit = Math.Min(n, CommandHistory.Count);
+
+        int start = CommandHistory.Count - limit;
+
+        for (int i = start; i < CommandHistory.Count; i++)
+            output.WriteLine($"    {i + 1}  {CommandHistory[i]}");
+    }
+
+    #endregion
+
+    // ========================================================================
+    //  REGION: Autocompletion
+    // ========================================================================
+
+    #region Autocompletion
 
     private class BuiltinAutoComplete : IAutoCompleteHandler
     {
-        public char[] Separators { get; set; } = new char[] { ' ' };
+        public char[] Separators { get; set; } = new[] { ' ' };
+        private static readonly string[] AutoBuiltins = { "echo", "exit", "history" };
 
-        private static readonly string[] AutoBuiltins = { "echo", "exit" };
-
-        // Used for multiple-match behavior (bell on first TAB, list on second).
         private string? lastPrefix = null;
-        private string[]? lastMatches = null;
 
-        // Computes the longest common prefix of a set of strings.
-        private static string LongestCommonPrefix(string[] arr)
+        private static string LCP(string[] arr)
         {
             if (arr.Length == 0) return "";
             if (arr.Length == 1) return arr[0];
 
-            var prefix = arr[0];
-            for (var i = 1; i < arr.Length; i++)
+            string prefix = arr[0];
+            for (int i = 1; i < arr.Length; i++)
             {
-                var j = 0;
+                int j = 0;
                 while (j < prefix.Length && j < arr[i].Length && prefix[j] == arr[i][j])
                     j++;
-
-                prefix = prefix.Substring(0, j);
+                prefix = prefix[..j];
                 if (prefix == "") break;
             }
 
@@ -44,106 +180,82 @@ internal class Program
         public string[] GetSuggestions(string text, int index)
         {
             var parts = text.Split(' ');
-            var currentWord = parts[0];
+            string current = parts[0];
 
-            // 1. Try builtin completion first.
-            var builtinMatches = AutoBuiltins
-                .Where(b => b.StartsWith(currentWord))
-                .ToArray();
-
+            var builtinMatches = AutoBuiltins.Where(b => b.StartsWith(current)).ToArray();
             if (builtinMatches.Length == 1)
                 return new[] { builtinMatches[0] + " " };
-
             if (builtinMatches.Length > 1)
             {
-                Console.Write("\x07"); // bell
+                Console.Write("\x07");
                 return Array.Empty<string>();
             }
 
-            // 2. If we're on the first word, try executable completion.
             if (parts.Length == 1)
             {
                 var suggestions = new List<string>();
+                string? pathEnv = Environment.GetEnvironmentVariable("PATH");
 
-                var pathEnv = Environment.GetEnvironmentVariable("PATH");
                 if (!string.IsNullOrEmpty(pathEnv))
                 {
-                    var directories = pathEnv.Split(Path.PathSeparator);
-                    var foundExecutables = new HashSet<string>();
-
-                    foreach (var dir in directories)
+                    foreach (var dir in pathEnv.Split(Path.PathSeparator))
                     {
-                        if (!Directory.Exists(dir))
-                            continue;
+                        if (!Directory.Exists(dir)) continue;
 
                         try
                         {
                             foreach (var file in Directory.GetFiles(dir))
                             {
-                                var fileName = Path.GetFileName(file);
-                                if (fileName.StartsWith(currentWord) && IsExecutable(file))
-                                    foundExecutables.Add(fileName);
+                                string name = Path.GetFileName(file);
+                                if (name.StartsWith(current) && IsExecutable(file))
+                                    suggestions.Add(name);
                             }
                         }
                         catch
                         {
-                            // Ignore directories we can't read.
                         }
                     }
-
-                    suggestions.AddRange(foundExecutables);
                 }
 
                 suggestions.Sort();
-
                 if (suggestions.Count == 0)
                 {
-                    Console.Write("\x07"); // bell for no matches
-                    return Array.Empty<string>();
-                }
-
-                // Longest Common Prefix logic for partial completion.
-                var lcp = LongestCommonPrefix(suggestions.ToArray());
-
-                // If LCP extends beyond current input, complete to LCP.
-                if (lcp.Length > currentWord.Length)
-                {
-                    if (suggestions.Count == 1)
-                        return new[] { lcp + " " }; // single match → trailing space
-
-                    return new[] { lcp }; // partial completion
-                }
-
-                // If LCP == current input and only one match, complete with space.
-                if (suggestions.Count == 1)
-                    return new[] { suggestions[0] + " " };
-
-                // Multiple matches: bell on first TAB, list on second.
-                if (lastPrefix != currentWord)
-                {
-                    lastPrefix = currentWord;
-                    lastMatches = suggestions.ToArray();
                     Console.Write("\x07");
                     return Array.Empty<string>();
                 }
-                else
+
+                string lcp = LCP(suggestions.ToArray());
+                if (lcp.Length > current.Length)
+                    return new[] { suggestions.Count == 1 ? lcp + " " : lcp };
+
+                if (suggestions.Count == 1)
+                    return new[] { suggestions[0] + " " };
+
+                if (lastPrefix != current)
                 {
-                    Console.WriteLine();
-                    Console.WriteLine(string.Join("  ", suggestions));
-                    Console.Write("$ " + currentWord);
-                    lastMatches = null;
+                    lastPrefix = current;
+                    Console.Write("\x07");
                     return Array.Empty<string>();
                 }
+
+                Console.WriteLine();
+                Console.WriteLine(string.Join("  ", suggestions));
+                Console.Write("$ " + current);
+                lastPrefix = null;
+                return Array.Empty<string>();
             }
 
-            // No argument completion for now.
             return Array.Empty<string>();
         }
     }
 
-    // ------------------------------------------------------------------------
-    // Redirection parsing and helpers
-    // ------------------------------------------------------------------------
+    #endregion
+
+    // ========================================================================
+    //  REGION: Redirection
+    // ========================================================================
+
+    #region Redirection
 
     private class RedirectionInfo
     {
@@ -153,20 +265,14 @@ internal class Program
         public bool StderrAppend { get; set; }
     }
 
-    private static bool IsBuiltin(string cmd)
-    {
-        return Builtins.Contains(cmd);
-    }
-
-    // Parse redirection tokens (>, >>, 2>, 2>>) and return cleaned args + info.
     private static (string[], RedirectionInfo) ParseRedirection(string[] tokens)
     {
         var cleaned = new List<string>();
         var info = new RedirectionInfo();
 
-        for (var i = 0; i < tokens.Length; i++)
+        for (int i = 0; i < tokens.Length; i++)
         {
-            var t = tokens[i];
+            string t = tokens[i];
 
             if ((t == ">>" || t == "1>>") && i + 1 < tokens.Length)
             {
@@ -197,10 +303,10 @@ internal class Program
         return (cleaned.ToArray(), info);
     }
 
-    // Writes to stdout or a redirected file, depending on redirection info.
     private static void WriteStdout(string text, RedirectionInfo redirect)
     {
         if (!string.IsNullOrEmpty(redirect.StdoutFile))
+        {
             try
             {
                 using var sw = new StreamWriter(
@@ -209,15 +315,16 @@ internal class Program
                         FileAccess.Write));
                 sw.WriteLine(text);
             }
-            catch (Exception ex)
+            catch
             {
-                Console.Error.WriteLine($"Error writing to file: {ex.Message}");
             }
+        }
         else
+        {
             Console.WriteLine(text);
+        }
     }
 
-    // Ensures a redirect target file exists, even if nothing is written.
     private static void EnsureFileCreated(string? path)
     {
         if (string.IsNullOrEmpty(path)) return;
@@ -225,33 +332,36 @@ internal class Program
         {
             using var _ = new FileStream(path, FileMode.OpenOrCreate, FileAccess.Write);
         }
-        catch (Exception ex)
+        catch
         {
-            Console.Error.WriteLine($"Error creating redirect file: {ex.Message}");
         }
     }
 
-    // ------------------------------------------------------------------------
-    // Executable lookup and execution
-    // ------------------------------------------------------------------------
+    #endregion
+
+    // ========================================================================
+    //  REGION: External Execution
+    // ========================================================================
+
+    #region ExternalExecution
 
     private static string? FindExecutableInPath(string cmd)
     {
-        var pathEnv = Environment.GetEnvironmentVariable("PATH");
-        if (string.IsNullOrEmpty(pathEnv))
-            return null;
+        string? pathEnv = Environment.GetEnvironmentVariable("PATH");
+        if (string.IsNullOrEmpty(pathEnv)) return null;
 
         foreach (var dir in pathEnv.Split(Path.PathSeparator))
+        {
             try
             {
-                var fullPath = Path.Combine(dir, cmd);
-                if (File.Exists(fullPath) && IsExecutable(fullPath))
-                    return fullPath;
+                string full = Path.Combine(dir, cmd);
+                if (File.Exists(full) && IsExecutable(full))
+                    return full;
             }
             catch
             {
-                // Ignore directories we can't access.
             }
+        }
 
         return null;
     }
@@ -260,21 +370,20 @@ internal class Program
     {
         try
         {
-            var fileInfo = new FileInfo(filePath);
-            if (fileInfo.Attributes.HasFlag(FileAttributes.Directory))
+            var info = new FileInfo(filePath);
+            if (info.Attributes.HasFlag(FileAttributes.Directory))
                 return false;
 
             if (!OperatingSystem.IsWindows())
             {
-                var unixAttrs = fileInfo.UnixFileMode;
-                return (unixAttrs &
-                        (UnixFileMode.UserExecute | UnixFileMode.GroupExecute | UnixFileMode.OtherExecute)) != 0;
+                var mode = info.UnixFileMode;
+                return (mode & (UnixFileMode.UserExecute |
+                                UnixFileMode.GroupExecute |
+                                UnixFileMode.OtherExecute)) != 0;
             }
-            else
-            {
-                var ext = Path.GetExtension(filePath).ToLower();
-                return ext == ".exe" || ext == ".bat" || ext == ".cmd" || ext == ".com" || ext == ".ps1";
-            }
+
+            string ext = Path.GetExtension(filePath).ToLower();
+            return ext is ".exe" or ".bat" or ".cmd" or ".com" or ".ps1";
         }
         catch
         {
@@ -282,15 +391,12 @@ internal class Program
         }
     }
 
-    private static string ShellEscape(string s)
-    {
-        return "'" + s.Replace("'", "'\\''") + "'";
-    }
+    private static string ShellEscape(string s) =>
+        "'" + s.Replace("'", "'\\''") + "'";
 
-    // Executes an external program, optionally with stdout/stderr redirection.
-    private static void ExecuteExternalProgram(string cmd, string[] args, RedirectionInfo? redirectInfo = null)
+    private static void ExecuteExternalProgram(string cmd, string[] args, RedirectionInfo? redirect)
     {
-        var execPath = FindExecutableInPath(cmd);
+        string? execPath = FindExecutableInPath(cmd);
         if (execPath == null)
         {
             Console.WriteLine($"{cmd}: command not found");
@@ -299,38 +405,25 @@ internal class Program
 
         try
         {
-            if (redirectInfo != null)
+            if (redirect != null)
             {
-                // Ensure redirect targets exist even if nothing is written.
-                EnsureFileCreated(redirectInfo.StdoutFile);
-                EnsureFileCreated(redirectInfo.StderrFile);
+                EnsureFileCreated(redirect.StdoutFile);
+                EnsureFileCreated(redirect.StderrFile);
             }
 
-            // Build a shell command line so redirection is handled by /bin/sh.
             var sb = new StringBuilder();
-            sb.Append("exec -a ");
-            sb.Append(ShellEscape(cmd));
-            sb.Append(" -- ");
-            sb.Append(ShellEscape(execPath));
+            sb.Append("exec -a ").Append(ShellEscape(cmd)).Append(" -- ").Append(ShellEscape(execPath));
+
             foreach (var arg in args)
-            {
-                sb.Append(' ');
-                sb.Append(ShellEscape(arg));
-            }
+                sb.Append(' ').Append(ShellEscape(arg));
 
-            if (redirectInfo != null && !string.IsNullOrEmpty(redirectInfo.StdoutFile))
-            {
-                sb.Append(redirectInfo.StdoutAppend ? " >> " : " > ");
-                sb.Append(ShellEscape(redirectInfo.StdoutFile));
-            }
+            if (redirect?.StdoutFile != null)
+                sb.Append(redirect.StdoutAppend ? " >> " : " > ").Append(ShellEscape(redirect.StdoutFile));
 
-            if (redirectInfo != null && !string.IsNullOrEmpty(redirectInfo.StderrFile))
-            {
-                sb.Append(redirectInfo.StderrAppend ? " 2>> " : " 2> ");
-                sb.Append(ShellEscape(redirectInfo.StderrFile));
-            }
+            if (redirect?.StderrFile != null)
+                sb.Append(redirect.StderrAppend ? " 2>> " : " 2> ").Append(ShellEscape(redirect.StderrFile));
 
-            var process = new Process
+            var p = new Process
             {
                 StartInfo = new ProcessStartInfo
                 {
@@ -339,331 +432,251 @@ internal class Program
                 }
             };
 
-            process.StartInfo.ArgumentList.Add("-c");
-            process.StartInfo.ArgumentList.Add(sb.ToString());
+            p.StartInfo.ArgumentList.Add("-c");
+            p.StartInfo.ArgumentList.Add(sb.ToString());
 
-            process.Start();
-            process.WaitForExit();
+            p.Start();
+            p.WaitForExit();
         }
-        catch (Exception ex)
+        catch
         {
-            Console.WriteLine($"Error executing {cmd}: {ex.Message}");
         }
     }
 
-    // ------------------------------------------------------------------------
-    // Two-command external pipeline (external | external)
-    // ------------------------------------------------------------------------
+    #endregion
 
-    // Streams stdout of left into stdin of right using async copy.
-    private static async Task ExecutePipelineExternalExternalAsync(string[] leftCmd, string[] rightCmd)
+    // ========================================================================
+    //  REGION: Pipelines
+    // ========================================================================
+
+    #region Pipelines
+
+    private static async Task ExecutePipelineExternalExternalAsync(string[] left, string[] right)
     {
-        if (leftCmd.Length == 0 || rightCmd.Length == 0)
-            return;
-
-        var leftExec = FindExecutableInPath(leftCmd[0]);
-        var rightExec = FindExecutableInPath(rightCmd[0]);
+        string? leftExec = FindExecutableInPath(left[0]);
+        string? rightExec = FindExecutableInPath(right[0]);
 
         if (leftExec == null)
         {
-            Console.WriteLine($"{leftCmd[0]}: command not found");
+            Console.WriteLine($"{left[0]}: command not found");
             return;
         }
 
         if (rightExec == null)
         {
-            Console.WriteLine($"{rightCmd[0]}: command not found");
+            Console.WriteLine($"{right[0]}: command not found");
             return;
         }
 
-        var left = new Process
+        var p1 = new Process
         {
             StartInfo = new ProcessStartInfo
             {
                 FileName = leftExec,
                 UseShellExecute = false,
-                RedirectStandardOutput = true,
-                RedirectStandardInput = false,
-                RedirectStandardError = false
+                RedirectStandardOutput = true
             }
         };
-        foreach (var arg in leftCmd.Skip(1))
-            left.StartInfo.ArgumentList.Add(arg);
+        foreach (var arg in left.Skip(1))
+            p1.StartInfo.ArgumentList.Add(arg);
 
-        var right = new Process
+        var p2 = new Process
         {
             StartInfo = new ProcessStartInfo
             {
                 FileName = rightExec,
                 UseShellExecute = false,
-                RedirectStandardInput = true,
-                RedirectStandardOutput = false,
-                RedirectStandardError = false
+                RedirectStandardInput = true
             }
         };
-        foreach (var arg in rightCmd.Skip(1))
-            right.StartInfo.ArgumentList.Add(arg);
+        foreach (var arg in right.Skip(1))
+            p2.StartInfo.ArgumentList.Add(arg);
 
-        left.Start();
-        right.Start();
+        p1.Start();
+        p2.Start();
 
-        // Stream data from left → right.
-        var copyTask = left.StandardOutput.BaseStream.CopyToAsync(right.StandardInput.BaseStream);
-        await copyTask;
-        right.StandardInput.Close();
+        await p1.StandardOutput.BaseStream.CopyToAsync(p2.StandardInput.BaseStream);
+        p2.StandardInput.Close();
 
-        right.WaitForExit();
-
-        if (!left.HasExited)
-            left.Kill();
-
-        left.WaitForExit();
+        p2.WaitForExit();
+        if (!p1.HasExited) p1.Kill();
+        p1.WaitForExit();
     }
-
-    // ------------------------------------------------------------------------
-    // Built-in execution helpers (for normal and pipeline contexts)
-    // ------------------------------------------------------------------------
-
-    // Runs a builtin and writes its output to the provided writer.
-    private static void RunBuiltinToWriter(string[] parts, TextWriter output)
-    {
-        var cmd = parts[0];
-
-        if (cmd == "echo")
-        {
-            var text = parts.Length > 1 ? string.Join(" ", parts.Skip(1)) : "";
-            output.WriteLine(text);
-        }
-        else if (cmd == "type")
-        {
-            if (parts.Length < 2)
-            {
-                output.WriteLine("type: missing operand");
-                return;
-            }
-
-            var target = parts[1];
-            if (IsBuiltin(target))
-            {
-                output.WriteLine($"{target} is a shell builtin");
-            }
-            else
-            {
-                var exec = FindExecutableInPath(target);
-                if (exec != null)
-                    output.WriteLine($"{target} is {exec}");
-                else
-                    output.WriteLine($"{target}: not found");
-            }
-        }
-        else if (cmd == "pwd")
-        {
-            output.WriteLine(Directory.GetCurrentDirectory());
-        }
-        else if (cmd == "cd")
-        {
-            // In pipeline context, cd should not affect the main shell process.
-            // For the current tests, we can safely ignore side effects here.
-        }
-    }
-
-    // ------------------------------------------------------------------------
-    // Two-command pipeline dispatcher (handles builtins + externals)
-    // ------------------------------------------------------------------------
 
     private static void ExecutePipeline(string[] left, string[] right)
     {
-        var leftIsBuiltin = left.Length > 0 && IsBuiltin(left[0]);
-        var rightIsBuiltin = right.Length > 0 && IsBuiltin(right[0]);
+        bool leftBuiltin = IsBuiltin(left[0]);
+        bool rightBuiltin = IsBuiltin(right[0]);
 
-        if (!leftIsBuiltin && !rightIsBuiltin)
+        if (!leftBuiltin && !rightBuiltin)
         {
-            // external | external
             ExecutePipelineExternalExternalAsync(left, right).GetAwaiter().GetResult();
+            return;
         }
-        else if (leftIsBuiltin && !rightIsBuiltin)
+
+        if (leftBuiltin && !rightBuiltin)
         {
-            // builtin | external
-            var rightExec = FindExecutableInPath(right[0]);
-            if (rightExec == null)
+            string? exec = FindExecutableInPath(right[0]);
+            if (exec == null)
             {
                 Console.WriteLine($"{right[0]}: command not found");
                 return;
             }
 
-            var proc = new Process
-            {
-                StartInfo = new ProcessStartInfo
-                {
-                    FileName = rightExec,
-                    UseShellExecute = false,
-                    RedirectStandardInput = true,
-                    RedirectStandardOutput = false,
-                    RedirectStandardError = false
-                }
-            };
-            foreach (var arg in right.Skip(1))
-                proc.StartInfo.ArgumentList.Add(arg);
-
-            proc.Start();
-
-            using (var writer =
-                   new StreamWriter(proc.StandardInput.BaseStream, new UTF8Encoding(false), leaveOpen: false))
-            {
-                writer.AutoFlush = true;
-                RunBuiltinToWriter(left, writer);
-            }
-
-            proc.WaitForExit();
-        }
-        else if (!leftIsBuiltin && rightIsBuiltin)
-        {
-            // external | builtin
-            var leftExec = FindExecutableInPath(left[0]);
-            if (leftExec == null)
-            {
-                Console.WriteLine($"{left[0]}: command not found");
-                return;
-            }
-
-            var proc = new Process
-            {
-                StartInfo = new ProcessStartInfo
-                {
-                    FileName = leftExec,
-                    UseShellExecute = false,
-                    RedirectStandardOutput = true,
-                    RedirectStandardInput = false,
-                    RedirectStandardError = false
-                }
-            };
-            foreach (var arg in left.Skip(1))
-                proc.StartInfo.ArgumentList.Add(arg);
-
-            proc.Start();
-
-            // For current tests (e.g., ls | type exit), the builtin doesn't read stdin.
-            // We must NOT print ls output, so we just drain it.
-            using (var reader = new StreamReader(proc.StandardOutput.BaseStream))
-            {
-                while (reader.ReadLine() != null)
-                {
-                }
-            }
-
-            proc.WaitForExit();
-
-            // Now run the builtin and print its output.
-            RunBuiltinToWriter(right, Console.Out);
-        }
-        else
-        {
-            // builtin | builtin
-            using var ms = new MemoryStream();
-            using (var writer = new StreamWriter(ms, new UTF8Encoding(false), leaveOpen: true))
-            {
-                writer.AutoFlush = true;
-                RunBuiltinToWriter(left, writer);
-            }
-
-            ms.Position = 0;
-            using var reader = new StreamReader(ms);
-            // Current builtins don't read stdin, so we ignore reader and just run the second builtin.
-            RunBuiltinToWriter(right, Console.Out);
-        }
-    }
-
-    // ------------------------------------------------------------------------
-    // Multi-command pipelines (3+ external commands)
-    // ------------------------------------------------------------------------
-
-    // Executes a pipeline with 3 or more commands, all external.
-    // For these stages, commands are finite (no tail -f), so we can use MemoryStreams.
-    private static void ExecuteMultiPipeline(string[] segments)
-    {
-        var commands = segments
-            .Select(s => ParseCommandLine(s.Trim()))
-            .Where(a => a.Length > 0)
-            .ToArray();
-
-        if (commands.Length == 0)
-            return;
-
-        MemoryStream? currentOutput = null;
-
-        for (var i = 0; i < commands.Length; i++)
-        {
-            var cmdParts = commands[i];
-            var exec = FindExecutableInPath(cmdParts[0]);
-            if (exec == null)
-            {
-                Console.WriteLine($"{cmdParts[0]}: command not found");
-                return;
-            }
-
-            var isLast = i == commands.Length - 1;
-
-            var proc = new Process
+            var p = new Process
             {
                 StartInfo = new ProcessStartInfo
                 {
                     FileName = exec,
                     UseShellExecute = false,
-                    RedirectStandardInput = currentOutput != null,
-                    RedirectStandardOutput = !isLast,
-                    RedirectStandardError = false
+                    RedirectStandardInput = true,
+                    RedirectStandardOutput = false
                 }
             };
 
-            foreach (var arg in cmdParts.Skip(1))
-                proc.StartInfo.ArgumentList.Add(arg);
+            foreach (var arg in right.Skip(1))
+                p.StartInfo.ArgumentList.Add(arg);
 
-            proc.Start();
+            p.Start();
 
-            // If we have previous stage output, feed it into this process.
-            if (currentOutput != null)
+            // Write builtin output into wc stdin
+            using (var writer = new StreamWriter(p.StandardInput.BaseStream, new UTF8Encoding(false)))
             {
-                currentOutput.Position = 0;
-                using (var stdin = proc.StandardInput.BaseStream)
+                writer.AutoFlush = true;
+                RunBuiltinToWriter(left, writer);
+            }
+
+            // Wait for wc to finish
+            p.WaitForExit();
+            return;
+        }
+
+        if (!leftBuiltin && rightBuiltin)
+        {
+            string? exec = FindExecutableInPath(left[0]);
+            if (exec == null)
+            {
+                Console.WriteLine($"{left[0]}: command not found");
+                return;
+            }
+
+            var p = new Process
+            {
+                StartInfo = new ProcessStartInfo
                 {
-                    currentOutput.CopyTo(stdin);
+                    FileName = exec,
+                    UseShellExecute = false,
+                    RedirectStandardOutput = true
+                }
+            };
+            foreach (var arg in left.Skip(1))
+                p.StartInfo.ArgumentList.Add(arg);
+
+            p.Start();
+
+            using (var reader = new StreamReader(p.StandardOutput.BaseStream))
+                while (reader.ReadLine() != null)
+                {
                 }
 
-                currentOutput.Dispose();
-                currentOutput = null;
-            }
+            p.WaitForExit();
 
-            // If not the last command, capture its output for the next stage.
-            if (!isLast)
+            RunBuiltinToWriter(right, Console.Out);
+            return;
+        }
+
+        using var ms = new MemoryStream();
+        using (var writer = new StreamWriter(ms, new UTF8Encoding(false), leaveOpen: true))
+        {
+            writer.AutoFlush = true;
+            RunBuiltinToWriter(left, writer);
+        }
+
+        ms.Position = 0;
+        RunBuiltinToWriter(right, Console.Out);
+    }
+
+    private static void ExecuteMultiPipeline(string[] segments)
+    {
+        var commands = segments.Select(s => ParseCommandLine(s.Trim()))
+            .Where(a => a.Length > 0)
+            .ToArray();
+
+        MemoryStream? prev = null;
+
+        for (int i = 0; i < commands.Length; i++)
+        {
+            var cmd = commands[i];
+            string? exec = FindExecutableInPath(cmd[0]);
+            if (exec == null)
             {
-                currentOutput = new MemoryStream();
-                proc.StandardOutput.BaseStream.CopyTo(currentOutput);
+                Console.WriteLine($"{cmd[0]}: command not found");
+                return;
             }
 
-            proc.WaitForExit();
+            bool last = i == commands.Length - 1;
+
+            var p = new Process
+            {
+                StartInfo = new ProcessStartInfo
+                {
+                    FileName = exec,
+                    UseShellExecute = false,
+                    RedirectStandardInput = prev != null,
+                    RedirectStandardOutput = !last
+                }
+            };
+
+            foreach (var arg in cmd.Skip(1))
+                p.StartInfo.ArgumentList.Add(arg);
+
+            p.Start();
+
+            if (prev != null)
+            {
+                prev.Position = 0;
+                prev.CopyTo(p.StandardInput.BaseStream);
+                p.StandardInput.Close();
+                prev.Dispose();
+                prev = null;
+            }
+
+            if (!last)
+            {
+                prev = new MemoryStream();
+                p.StandardOutput.BaseStream.CopyTo(prev);
+            }
+
+            p.WaitForExit();
         }
     }
 
-    // ------------------------------------------------------------------------
-    // Command line parsing (handles quotes and escapes)
-    // ------------------------------------------------------------------------
+    #endregion
+
+    // ========================================================================
+    //  REGION: Parsing
+    // ========================================================================
+
+    #region Parsing
 
     private static string[] ParseCommandLine(string input)
     {
         var tokens = new List<string>();
         var current = new StringBuilder();
-        bool inSingle = false, inDouble = false;
+        bool inSingle = false;
+        bool inDouble = false;
 
-        for (var i = 0; i < input.Length; i++)
+        for (int i = 0; i < input.Length; i++)
         {
-            var c = input[i];
+            char c = input[i];
 
             if (c == '\\' && inDouble)
             {
                 if (i + 1 < input.Length)
                 {
-                    var next = input[++i];
-                    if (next != '\n') current.Append(next);
+                    char next = input[++i];
+                    if (next != '\n')
+                        current.Append(next);
                 }
 
                 continue;
@@ -671,7 +684,8 @@ internal class Program
 
             if (c == '\\' && !inSingle && !inDouble)
             {
-                if (i + 1 < input.Length) current.Append(input[++i]);
+                if (i + 1 < input.Length)
+                    current.Append(input[++i]);
                 continue;
             }
 
@@ -687,6 +701,7 @@ internal class Program
                 continue;
             }
 
+            // Space ends token (only when not inside quotes)
             if (c == ' ' && !inSingle && !inDouble)
             {
                 if (current.Length > 0)
@@ -698,67 +713,108 @@ internal class Program
                 continue;
             }
 
+            // Normal character
             current.Append(c);
         }
 
-        if (current.Length > 0) tokens.Add(current.ToString());
+        // Add last token
+        if (current.Length > 0)
+            tokens.Add(current.ToString());
+
         return tokens.ToArray();
     }
 
-    // ------------------------------------------------------------------------
-    // Main REPL loop
-    // ------------------------------------------------------------------------
+    #endregion
+
+    // ========================================================================
+    //  REGION: Main Loop (REPL)
+    // ========================================================================
+    #region MainLoop
 
     private static void Main()
     {
-        // Enable TAB autocompletion.
+        // Enable TAB autocompletion
         ReadLine.ReadLine.Context.AutoCompletionHandler = new BuiltinAutoComplete();
+
+        // Load history from HISTFILE on startup
+        string? histfile = Environment.GetEnvironmentVariable("HISTFILE");
+        if (!string.IsNullOrEmpty(histfile) && File.Exists(histfile))
+            LoadHistoryFromFile(histfile);
 
         while (true)
         {
             Console.Write("$ ");
-            var input = ReadLine.ReadLine.Read("");
-            if (input == null) break;
+            string? input = ReadLine.ReadLine.Read("");
+            if (input == null)
+                break;
 
-            // Handle pipelines first.
+            if (string.IsNullOrWhiteSpace(input))
+                continue;
+
+            // Always add to history (including exit)
+            AddToHistory(input);
+
+            // -------------------------
+            // PIPELINES
+            // -------------------------
             if (input.Contains("|"))
             {
                 var segments = input.Split('|');
 
                 if (segments.Length == 2)
                 {
-                    // Two-command pipeline (may involve builtins).
                     var left = ParseCommandLine(segments[0].Trim());
                     var right = ParseCommandLine(segments[1].Trim());
-                    if (left.Length == 0 || right.Length == 0)
-                        continue;
 
-                    ExecutePipeline(left, right);
+                    if (left.Length > 0 && right.Length > 0)
+                        ExecutePipeline(left, right);
                 }
                 else
                 {
-                    // Multi-command pipeline (3+), external commands only.
                     ExecuteMultiPipeline(segments);
                 }
 
                 continue;
             }
 
-            // Normal (non-pipeline) command.
+            // -------------------------
+            // NORMAL COMMAND
+            // -------------------------
             var parts = ParseCommandLine(input);
-            if (parts.Length == 0) continue;
+            if (parts.Length == 0)
+                continue;
 
             var (cleaned, redirect) = ParseRedirection(parts);
-            if (cleaned.Length == 0) continue;
+            if (cleaned.Length == 0)
+                continue;
 
-            var cmd = cleaned[0];
+            string cmd = cleaned[0];
 
-            if (cmd == "exit") break;
+            // -------------------------
+            // EXIT (write history!)
+            // -------------------------
+            if (cmd == "exit")
+            {
+                if (!string.IsNullOrEmpty(histfile))
+                    WriteHistoryToFile(histfile);
 
+                break;
+            }
+
+            // -------------------------
+            // BUILTINS
+            // -------------------------
             if (cmd == "echo")
             {
-                var output = cleaned.Length == 1 ? "" : string.Join(" ", cleaned.Skip(1));
+                string output = cleaned.Length > 1 ? string.Join(" ", cleaned.Skip(1)) : "";
                 WriteStdout(output, redirect);
+                EnsureFileCreated(redirect.StderrFile);
+                continue;
+            }
+
+            if (cmd == "pwd")
+            {
+                WriteStdout(Directory.GetCurrentDirectory(), redirect);
                 EnsureFileCreated(redirect.StderrFile);
                 continue;
             }
@@ -771,21 +827,13 @@ internal class Program
                     continue;
                 }
 
-                var target = cleaned[1];
-                var result = IsBuiltin(target)
-                    ? $"{target} is a shell builtin"
-                    : FindExecutableInPath(target) is string p
-                        ? $"{target} is {p}"
-                        : $"{target}: not found";
+                string target = cleaned[1];
+                string result =
+                    IsBuiltin(target) ? $"{target} is a shell builtin" :
+                    FindExecutableInPath(target) is string p ? $"{target} is {p}" :
+                    $"{target}: not found";
 
                 WriteStdout(result, redirect);
-                EnsureFileCreated(redirect.StderrFile);
-                continue;
-            }
-
-            if (cmd == "pwd")
-            {
-                WriteStdout(Directory.GetCurrentDirectory(), redirect);
                 EnsureFileCreated(redirect.StderrFile);
                 continue;
             }
@@ -798,11 +846,11 @@ internal class Program
                     continue;
                 }
 
-                var target = cleaned[1];
+                string target = cleaned[1];
 
                 if (target == "~" || target.StartsWith("~/"))
                 {
-                    var home = Environment.GetEnvironmentVariable("HOME");
+                    string? home = Environment.GetEnvironmentVariable("HOME");
                     if (string.IsNullOrEmpty(home))
                     {
                         Console.WriteLine("cd: HOME not set");
@@ -818,20 +866,26 @@ internal class Program
                     continue;
                 }
 
-                try
-                {
-                    Directory.SetCurrentDirectory(target);
-                }
-                catch (Exception ex)
-                {
-                    Console.WriteLine($"cd: {cleaned[1]}: {ex.Message}");
-                }
+                try { Directory.SetCurrentDirectory(target); }
+                catch (Exception ex) { Console.WriteLine($"cd: {cleaned[1]}: {ex.Message}"); }
 
                 continue;
             }
 
-            // Fallback: external command.
+            if (cmd == "history")
+            {
+                RunBuiltinToWriter(cleaned, Console.Out);
+                continue;
+            }
+
+            // -------------------------
+            // EXTERNAL COMMAND
+            // -------------------------
             ExecuteExternalProgram(cmd, cleaned.Skip(1).ToArray(), redirect);
         }
     }
+
+    #endregion
 }
+
+
