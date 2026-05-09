@@ -10,7 +10,7 @@ internal class Program
 
     #region Builtins
 
-    private static readonly string[] Builtins = { "echo", "exit", "type", "pwd", "cd", "history" };
+    private static readonly string[] Builtins = { "echo", "exit", "type", "pwd", "cd", "history", "declare" };
 
     private static readonly List<string> CommandHistory = new();
     private static int HistoryAppendCursor = 0;
@@ -155,7 +155,7 @@ internal class Program
     private class BuiltinAutoComplete : IAutoCompleteHandler
     {
         public char[] Separators { get; set; } = new[] { ' ' };
-        private static readonly string[] AutoBuiltins = { "echo", "exit", "history" };
+        private static readonly string[] AutoBuiltins = { "echo", "exit", "history", "declare" };
 
         private string? lastPrefix = null;
 
