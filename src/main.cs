@@ -14,6 +14,7 @@ internal class Program
 
     private static readonly List<string> CommandHistory = new();
     private static int HistoryAppendCursor = 0;
+    private static readonly Dictionary<string, string> ShellVariables = new();
 
     private static bool IsBuiltin(string cmd) => Builtins.Contains(cmd);
 
@@ -108,6 +109,10 @@ internal class Program
                 HandleHistoryBuiltin(parts, output);
                 break;
 
+            case "declare":
+                HandleDeclareBuiltin(parts, output);
+                break;
+
             case "cd":
                 // cd inside pipelines does nothing
                 break;
@@ -142,6 +147,23 @@ internal class Program
 
         for (int i = start; i < CommandHistory.Count; i++)
             output.WriteLine($"    {i + 1}  {CommandHistory[i]}");
+    }
+
+    private static void HandleDeclareBuiltin(string[] parts, TextWriter output)
+    {
+        // Handle declare -p variable_name
+        if (parts.Length > 2 && parts[1] == "-p")
+        {
+            string varName = parts[2];
+            if (ShellVariables.TryGetValue(varName, out var value))
+            {
+                output.WriteLine($"declare -- {varName}=\"{value}\"");
+            }
+            else
+            {
+                output.WriteLine($"declare: {varName}: not found");
+            }
+        }
     }
 
     #endregion
@@ -875,6 +897,39 @@ internal class Program
             if (cmd == "history")
             {
                 RunBuiltinToWriter(cleaned, Console.Out);
+                continue;
+            }
+
+            if (cmd == "declare")
+            {
+                // Handle declare -p variable_name
+                if (cleaned.Length > 2 && cleaned[1] == "-p")
+                {
+                    string varName = cleaned[2];
+                    if (ShellVariables.TryGetValue(varName, out var value))
+                    {
+                        Console.WriteLine($"declare -- {varName}=\"{value}\"");
+                    }
+                    else
+                    {
+                        Console.WriteLine($"declare: {varName}: not found");
+                    }
+                    continue;
+                }
+
+                // Handle declare NAME=VALUE
+                if (cleaned.Length > 1)
+                {
+                    string arg = cleaned[1];
+                    int eqIdx = arg.IndexOf('=');
+                    if (eqIdx > 0)
+                    {
+                        string varName = arg.Substring(0, eqIdx);
+                        string varValue = arg.Substring(eqIdx + 1);
+                        ShellVariables[varName] = varValue;
+                    }
+                }
+
                 continue;
             }
 
