@@ -18,6 +18,82 @@ internal class Program
 
     private static bool IsBuiltin(string cmd) => Builtins.Contains(cmd);
 
+    private static bool IsValidIdentifier(string name)
+    {
+        if (string.IsNullOrEmpty(name))
+            return false;
+
+        // First character must be a letter or underscore
+        if (!char.IsLetter(name[0]) && name[0] != '_')
+            return false;
+
+        // Rest must be letters, digits, or underscores
+        for (int i = 1; i < name.Length; i++)
+        {
+            if (!char.IsLetterOrDigit(name[i]) && name[i] != '_')
+                return false;
+        }
+
+        return true;
+    }
+
+    private static string ExpandParameters(string token)
+    {
+        var result = new StringBuilder();
+        int i = 0;
+
+        while (i < token.Length)
+        {
+            if (token[i] == '$' && i + 1 < token.Length)
+            {
+                // Check if next character starts a valid identifier
+                int j = i + 1;
+                if (char.IsLetter(token[j]) || token[j] == '_')
+                {
+                    // Extract the variable name
+                    while (j < token.Length && (char.IsLetterOrDigit(token[j]) || token[j] == '_'))
+                        j++;
+
+                    string varName = token.Substring(i + 1, j - i - 1);
+
+                    // Look up the variable
+                    if (ShellVariables.TryGetValue(varName, out var value))
+                    {
+                        result.Append(value);
+                    }
+                    else
+                    {
+                        // Variable not found -> expand to empty string (behave like shell)
+                        // i.e. append nothing
+                    }
+
+                    i = j;
+                    continue;
+                }
+            }
+
+            result.Append(token[i]);
+            i++;
+        }
+
+        return result.ToString();
+    }
+
+    private static List<string> ExpandAndSplitArguments(string[] parts)
+    {
+        var result = new List<string>();
+
+        foreach (var p in parts)
+        {
+            // Expand parameters in the token. Do NOT perform additional word-splitting
+            // here so that quoted tokens that contain spaces remain a single argument.
+            string expanded = ExpandParameters(p);
+            result.Add(expanded);
+        }
+
+        return result;
+    }
+
     private static void AddToHistory(string entry)
     {
         // Never store empty lines
@@ -82,7 +158,8 @@ internal class Program
         switch (cmd)
         {
             case "echo":
-                output.WriteLine(parts.Length > 1 ? string.Join(" ", parts.Skip(1)) : "");
+                var expandedEchoArgs = parts.Length > 1 ? ExpandAndSplitArguments(parts.Skip(1).ToArray()).ToArray() : Array.Empty<string>();
+                output.WriteLine(expandedEchoArgs.Length > 0 ? string.Join(" ", expandedEchoArgs) : "");
                 break;
 
             case "pwd":
@@ -96,7 +173,7 @@ internal class Program
                     return;
                 }
 
-                string target = parts[1];
+                string target = ExpandParameters(parts[1]);
                 if (IsBuiltin(target))
                     output.WriteLine($"{target} is a shell builtin");
                 else if (FindExecutableInPath(target) is string p)
@@ -154,7 +231,7 @@ internal class Program
         // Handle declare -p variable_name
         if (parts.Length > 2 && parts[1] == "-p")
         {
-            string varName = parts[2];
+            string varName = ExpandParameters(parts[2]);
             if (ShellVariables.TryGetValue(varName, out var value))
             {
                 output.WriteLine($"declare -- {varName}=\"{value}\"");
@@ -162,6 +239,31 @@ internal class Program
             else
             {
                 output.WriteLine($"declare: {varName}: not found");
+            }
+            return;
+        }
+
+        // Handle declare NAME=VALUE
+        if (parts.Length > 1)
+        {
+            string arg = parts[1];
+            int eqIdx = arg.IndexOf('=');
+            if (eqIdx > 0)
+            {
+                string varName = arg.Substring(0, eqIdx);
+                string varValue = arg.Substring(eqIdx + 1);
+
+                // Expand parameters in the value
+                varValue = ExpandParameters(varValue);
+
+                // Validate variable name
+                if (!IsValidIdentifier(varName))
+                {
+                    output.WriteLine($"declare: `{arg}': not a valid identifier");
+                    return;
+                }
+
+                ShellVariables[varName] = varValue;
             }
         }
     }
@@ -622,6 +724,7 @@ internal class Program
     {
         var commands = segments.Select(s => ParseCommandLine(s.Trim()))
             .Where(a => a.Length > 0)
+            .Select(a => ExpandAndSplitArguments(a).ToArray())
             .ToArray();
 
         MemoryStream? prev = null;
@@ -755,8 +858,9 @@ internal class Program
 
     private static void Main()
     {
-        // Enable TAB autocompletion
-        ReadLine.ReadLine.Context.AutoCompletionHandler = new BuiltinAutoComplete();
+        // Enable TAB autocompletion only when input is not redirected (interactive)
+        if (!Console.IsInputRedirected)
+            ReadLine.ReadLine.Context.AutoCompletionHandler = new BuiltinAutoComplete();
 
         // Load history from HISTFILE on startup
         string? histfile = Environment.GetEnvironmentVariable("HISTFILE");
@@ -766,7 +870,18 @@ internal class Program
         while (true)
         {
             Console.Write("$ ");
-            string? input = ReadLine.ReadLine.Read("");
+            string? input;
+            if (Console.IsInputRedirected)
+            {
+                // When tests pipe commands into stdin, ReadLine echoes the input back
+                // which causes duplicated lines in test output. Use Console.ReadLine
+                // to avoid that behavior in non-interactive mode.
+                input = Console.ReadLine();
+            }
+            else
+            {
+                input = ReadLine.ReadLine.Read("");
+            }
             if (input == null)
                 break;
 
@@ -788,8 +903,11 @@ internal class Program
                     var left = ParseCommandLine(segments[0].Trim());
                     var right = ParseCommandLine(segments[1].Trim());
 
-                    if (left.Length > 0 && right.Length > 0)
-                        ExecutePipeline(left, right);
+                    var leftExpanded = ExpandAndSplitArguments(left).ToArray();
+                    var rightExpanded = ExpandAndSplitArguments(right).ToArray();
+
+                    if (leftExpanded.Length > 0 && rightExpanded.Length > 0)
+                        ExecutePipeline(leftExpanded, rightExpanded);
                 }
                 else
                 {
@@ -810,7 +928,11 @@ internal class Program
             if (cleaned.Length == 0)
                 continue;
 
-            string cmd = cleaned[0];
+            var expandedList = ExpandAndSplitArguments(cleaned);
+            if (expandedList.Count == 0)
+                continue;
+
+            string cmd = expandedList[0];
 
             // -------------------------
             // EXIT (write history!)
@@ -828,7 +950,7 @@ internal class Program
             // -------------------------
             if (cmd == "echo")
             {
-                string output = cleaned.Length > 1 ? string.Join(" ", cleaned.Skip(1)) : "";
+                string output = expandedList.Skip(1).Any() ? string.Join(" ", expandedList.Skip(1)) : "";
                 WriteStdout(output, redirect);
                 EnsureFileCreated(redirect.StderrFile);
                 continue;
@@ -843,13 +965,13 @@ internal class Program
 
             if (cmd == "type")
             {
-                if (cleaned.Length < 2)
+                if (expandedList.Count < 2)
                 {
                     Console.WriteLine("type: missing operand");
                     continue;
                 }
 
-                string target = cleaned[1];
+                string target = expandedList[1];
                 string result =
                     IsBuiltin(target) ? $"{target} is a shell builtin" :
                     FindExecutableInPath(target) is string p ? $"{target} is {p}" :
@@ -862,13 +984,13 @@ internal class Program
 
             if (cmd == "cd")
             {
-                if (cleaned.Length < 2)
+                if (expandedList.Count < 2)
                 {
                     Console.WriteLine("cd: missing operand");
                     continue;
                 }
 
-                string target = cleaned[1];
+                string target = expandedList[1];
 
                 if (target == "~" || target.StartsWith("~/"))
                 {
@@ -884,59 +1006,33 @@ internal class Program
 
                 if (!Directory.Exists(target))
                 {
-                    Console.WriteLine($"cd: {cleaned[1]}: No such file or directory");
+                    Console.WriteLine($"cd: {expandedList[1]}: No such file or directory");
                     continue;
                 }
 
                 try { Directory.SetCurrentDirectory(target); }
-                catch (Exception ex) { Console.WriteLine($"cd: {cleaned[1]}: {ex.Message}"); }
+                catch (Exception ex) { Console.WriteLine($"cd: {expandedList[1]}: {ex.Message}"); }
 
                 continue;
             }
 
             if (cmd == "history")
             {
-                RunBuiltinToWriter(cleaned, Console.Out);
+                RunBuiltinToWriter(expandedList.ToArray(), Console.Out);
                 continue;
             }
 
             if (cmd == "declare")
             {
-                // Handle declare -p variable_name
-                if (cleaned.Length > 2 && cleaned[1] == "-p")
-                {
-                    string varName = cleaned[2];
-                    if (ShellVariables.TryGetValue(varName, out var value))
-                    {
-                        Console.WriteLine($"declare -- {varName}=\"{value}\"");
-                    }
-                    else
-                    {
-                        Console.WriteLine($"declare: {varName}: not found");
-                    }
-                    continue;
-                }
-
-                // Handle declare NAME=VALUE
-                if (cleaned.Length > 1)
-                {
-                    string arg = cleaned[1];
-                    int eqIdx = arg.IndexOf('=');
-                    if (eqIdx > 0)
-                    {
-                        string varName = arg.Substring(0, eqIdx);
-                        string varValue = arg.Substring(eqIdx + 1);
-                        ShellVariables[varName] = varValue;
-                    }
-                }
-
+                RunBuiltinToWriter(expandedList.ToArray(), Console.Out);
                 continue;
             }
 
             // -------------------------
             // EXTERNAL COMMAND
             // -------------------------
-            ExecuteExternalProgram(cmd, cleaned.Skip(1).ToArray(), redirect);
+            var externalArgs = expandedList.Skip(1).ToArray();
+            ExecuteExternalProgram(cmd, externalArgs, redirect);
         }
     }
 
