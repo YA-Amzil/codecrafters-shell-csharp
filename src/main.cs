@@ -37,6 +37,88 @@ internal class Program
         return true;
     }
 
+    // Expand variables inside a single token. Supports $NAME and ${NAME} forms.
+    private static string ExpandToken(string token)
+    {
+        if (string.IsNullOrEmpty(token)) return token;
+
+        var sb = new StringBuilder();
+        for (int i = 0; i < token.Length; i++)
+        {
+            char c = token[i];
+            if (c != '$')
+            {
+                sb.Append(c);
+                continue;
+            }
+
+            // Found '$'
+            if (i + 1 >= token.Length)
+            {
+                // Trailing $, keep as literal
+                sb.Append('$');
+                continue;
+            }
+
+            char next = token[i + 1];
+            if (next == '{')
+            {
+                // ${NAME}
+                int end = token.IndexOf('}', i + 2);
+                if (end == -1)
+                {
+                    // No closing brace, treat literally
+                    sb.Append("${");
+                    i += 1; // move past '{'
+                    continue;
+                }
+
+                string name = token.Substring(i + 2, end - (i + 2));
+                if (ShellVariables.TryGetValue(name, out var val))
+                    sb.Append(val);
+                // else append nothing (unset -> empty)
+
+                i = end; // move past '}'
+                continue;
+            }
+
+            // $NAME where NAME starts with letter or underscore
+            if (char.IsLetter(next) || next == '_')
+            {
+                int j = i + 1;
+                while (j < token.Length && (char.IsLetterOrDigit(token[j]) || token[j] == '_')) j++;
+                string name = token.Substring(i + 1, j - (i + 1));
+                if (ShellVariables.TryGetValue(name, out var val))
+                    sb.Append(val);
+                // else append nothing
+
+                i = j - 1;
+                continue;
+            }
+
+            // Not a valid variable name, leave the dollar sign as-is
+            sb.Append('$');
+        }
+
+        return sb.ToString();
+    }
+
+    // Expand an array of tokens. Drops any tokens that expand to empty strings.
+    private static List<string> ExpandWords(string[] tokens)
+    {
+        var result = new List<string>();
+        foreach (var t in tokens)
+        {
+            string expanded = ExpandToken(t);
+            if (!string.IsNullOrEmpty(expanded))
+            {
+                result.Add(expanded);
+            }
+        }
+
+        return result;
+    }
+
     private static string ExpandParameters(string token)
     {
         var result = new StringBuilder();
@@ -46,6 +128,24 @@ internal class Program
         {
             if (token[i] == '$' && i + 1 < token.Length)
             {
+                if (token[i + 1] == '{')
+                {
+                    int endBrace = token.IndexOf('}', i + 2);
+                    if (endBrace > i + 2)
+                    {
+                        string varName = token.Substring(i + 2, endBrace - (i + 2));
+                        if (IsValidIdentifier(varName) && ShellVariables.TryGetValue(varName, out var braceValue))
+                            result.Append(braceValue);
+
+                        i = endBrace + 1;
+                        continue;
+                    }
+
+                    result.Append(token[i]);
+                    i++;
+                    continue;
+                }
+
                 // Check if next character starts a valid identifier
                 int j = i + 1;
                 if (char.IsLetter(token[j]) || token[j] == '_')
@@ -60,11 +160,6 @@ internal class Program
                     if (ShellVariables.TryGetValue(varName, out var value))
                     {
                         result.Append(value);
-                    }
-                    else
-                    {
-                        // Variable not found -> expand to empty string (behave like shell)
-                        // i.e. append nothing
                     }
 
                     i = j;
@@ -88,7 +183,9 @@ internal class Program
             // Expand parameters in the token. Do NOT perform additional word-splitting
             // here so that quoted tokens that contain spaces remain a single argument.
             string expanded = ExpandParameters(p);
-            result.Add(expanded);
+            // If expansion yields an empty string, drop the resulting word
+            if (!string.IsNullOrEmpty(expanded))
+                result.Add(expanded);
         }
 
         return result;
@@ -927,6 +1024,12 @@ internal class Program
             var (cleaned, redirect) = ParseRedirection(parts);
             if (cleaned.Length == 0)
                 continue;
+
+            // Expand redirection targets as they may contain parameters
+            if (!string.IsNullOrEmpty(redirect.StdoutFile))
+                redirect.StdoutFile = ExpandParameters(redirect.StdoutFile);
+            if (!string.IsNullOrEmpty(redirect.StderrFile))
+                redirect.StderrFile = ExpandParameters(redirect.StderrFile);
 
             var expandedList = ExpandAndSplitArguments(cleaned);
             if (expandedList.Count == 0)
