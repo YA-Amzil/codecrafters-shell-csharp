@@ -403,6 +403,60 @@ internal class Program
             var parts = text.Split(' ');
             string current = parts[0];
 
+            // ---------------------------------------------------------------
+            // Argument completion (parts.Length > 1): complete filenames
+            // ---------------------------------------------------------------
+            if (parts.Length > 1)
+            {
+                string filePrefix = parts[^1]; // partial filename typed so far
+
+                try
+                {
+                    // Determine the directory to search and the name prefix
+                    string searchDir;
+                    string namePrefix;
+
+                    if (string.IsNullOrEmpty(filePrefix))
+                    {
+                        searchDir = ".";
+                        namePrefix = "";
+                    }
+                    else
+                    {
+                        string? dirPart = Path.GetDirectoryName(filePrefix);
+                        searchDir = string.IsNullOrEmpty(dirPart) ? "." : dirPart;
+                        namePrefix = Path.GetFileName(filePrefix);
+                    }
+
+                    var matches = Directory.GetFileSystemEntries(searchDir)
+                        .Select(e => Path.GetFileName(e)!)
+                        .Where(name => name.StartsWith(namePrefix, StringComparison.Ordinal))
+                        .OrderBy(name => name)
+                        .ToArray();
+
+                    if (matches.Length == 1)
+                    {
+                        // Build the completed argument, preserving any directory prefix
+                        string completedArg = (searchDir == ".")
+                            ? matches[0]
+                            : Path.Combine(searchDir, matches[0]);
+
+                        // Return only the completed filename + trailing space.
+                        // ReadLine replaces the current word (after last separator) with this value.
+                        return new[] { completedArg + " " };
+                    }
+                }
+                catch
+                {
+                    // If directory enumeration fails, fall through silently
+                }
+
+                return Array.Empty<string>();
+            }
+
+            // ---------------------------------------------------------------
+            // Command completion (first word)
+            // ---------------------------------------------------------------
             var builtinMatches = AutoBuiltins.Where(b => b.StartsWith(current)).ToArray();
             if (builtinMatches.Length == 1)
                 return new[] { builtinMatches[0] + " " };
@@ -412,7 +466,6 @@ internal class Program
                 return Array.Empty<string>();
             }
 
-            if (parts.Length == 1)
             {
                 var suggestions = new List<string>();
                 string? pathEnv = Environment.GetEnvironmentVariable("PATH");
@@ -465,8 +518,6 @@ internal class Program
                 lastPrefix = null;
                 return Array.Empty<string>();
             }
-
-            return Array.Empty<string>();
         }
     }
 
@@ -1141,5 +1192,3 @@ internal class Program
 
     #endregion
 }
-
-
