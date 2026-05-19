@@ -10,11 +10,12 @@ internal class Program
 
     #region Builtins
 
-    private static readonly string[] Builtins = { "echo", "exit", "type", "pwd", "cd", "history", "declare" };
+    private static readonly string[] Builtins = { "echo", "exit", "type", "pwd", "cd", "history", "declare", "complete" };
 
     private static readonly List<string> CommandHistory = new();
     private static int HistoryAppendCursor = 0;
     private static readonly Dictionary<string, string> ShellVariables = new();
+    private static readonly Dictionary<string, string> CompletionSpecs = new();
 
     private static bool IsBuiltin(string cmd) => Builtins.Contains(cmd);
 
@@ -290,6 +291,23 @@ internal class Program
             case "cd":
                 // cd inside pipelines does nothing
                 break;
+
+            case "complete":
+                if (parts.Length > 3 && parts[1] == "-C")
+                {
+                    string scriptPath = ExpandParameters(parts[2]);
+                    string cmdName = ExpandParameters(parts[3]);
+                    CompletionSpecs[cmdName] = scriptPath;
+                }
+                else if (parts.Length > 2 && parts[1] == "-p")
+                {
+                    string completeName = ExpandParameters(parts[2]);
+                    if (CompletionSpecs.TryGetValue(completeName, out var spec))
+                        output.WriteLine($"complete -C '{spec}' {completeName}");
+                    else
+                        output.WriteLine($"complete: {completeName}: no completion specification");
+                }
+                break;
         }
     }
 
@@ -376,7 +394,7 @@ internal class Program
     private class BuiltinAutoComplete : IAutoCompleteHandler
     {
         public char[] Separators { get; set; } = new[] { ' ' };
-        private static readonly string[] AutoBuiltins = { "echo", "exit", "history", "declare" };
+        private static readonly string[] AutoBuiltins = { "echo", "exit", "history", "declare", "complete" };
 
         private string? lastPrefix = null;
 
@@ -408,6 +426,45 @@ internal class Program
             // ---------------------------------------------------------------
             if (parts.Length > 1)
             {
+                // Check if a completer script is registered for this command
+                if (CompletionSpecs.TryGetValue(current, out var completerScript))
+                {
+                    try
+                    {
+                        var p = new Process
+                        {
+                            StartInfo = new ProcessStartInfo
+                            {
+                                FileName = completerScript,
+                                UseShellExecute = false,
+                                RedirectStandardOutput = true
+                            }
+                        };
+
+                        p.Start();
+                        string output = p.StandardOutput.ReadToEnd();
+                        p.WaitForExit();
+
+                        var lines = output.Split('\n', StringSplitOptions.RemoveEmptyEntries);
+                        if (lines.Length == 1)
+                            return new[] { lines[0].Trim() + " " };
+
+                        if (lines.Length > 1)
+                        {
+                            // Multiple candidates: print them and ring bell
+                            Console.WriteLine();
+                            Console.WriteLine(string.Join("  ", lines.Select(l => l.Trim())));
+                            Console.Write("$ " + text);
+                        }
+                    }
+                    catch
+                    {
+                        // If script execution fails, fall through
+                    }
+
+                    return Array.Empty<string>();
+                }
+
                 string filePrefix = parts[^1]; // partial filename typed so far
 
                 try
@@ -1179,6 +1236,23 @@ internal class Program
             if (cmd == "declare")
             {
                 RunBuiltinToWriter(expandedList.ToArray(), Console.Out);
+                continue;
+            }
+
+            if (cmd == "complete")
+            {
+                if (expandedList.Count > 3 && expandedList[1] == "-C")
+                {
+                    CompletionSpecs[expandedList[3]] = expandedList[2];
+                }
+                else if (expandedList.Count > 2 && expandedList[1] == "-p")
+                {
+                    string completeName = expandedList[2];
+                    if (CompletionSpecs.TryGetValue(completeName, out var spec))
+                        Console.WriteLine($"complete -C '{spec}' {completeName}");
+                    else
+                        Console.WriteLine($"complete: {completeName}: no completion specification");
+                }
                 continue;
             }
 
