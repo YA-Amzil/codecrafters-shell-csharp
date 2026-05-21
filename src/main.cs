@@ -446,12 +446,19 @@ internal class Program
                         p.WaitForExit();
 
                         var lines = output.Split('\n', StringSplitOptions.RemoveEmptyEntries);
+                        if (lines.Length == 0)
+                        {
+                            // No candidates: ring bell and leave input unchanged
+                            Console.Write("\x07");
+                            return Array.Empty<string>();
+                        }
+
                         if (lines.Length == 1)
                             return new[] { lines[0].Trim() + " " };
 
                         if (lines.Length > 1)
                         {
-                            // Multiple candidates: print them and ring bell
+                            // Multiple candidates: print them and leave input unchanged
                             Console.WriteLine();
                             Console.WriteLine(string.Join("  ", lines.Select(l => l.Trim())));
                             Console.Write("$ " + text);
@@ -459,7 +466,9 @@ internal class Program
                     }
                     catch
                     {
-                        // If script execution fails, fall through
+                        // If script execution fails, ring the bell and leave input unchanged
+                        Console.Write("\x07");
+                        return Array.Empty<string>();
                     }
 
                     return Array.Empty<string>();
