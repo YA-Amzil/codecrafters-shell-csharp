@@ -397,6 +397,7 @@ internal class Program
         private static readonly string[] AutoBuiltins = { "echo", "exit", "history", "declare", "complete" };
 
         private string? lastPrefix = null;
+        private string? lastCompleterPrefix = null;
 
         private static string LCP(string[] arr)
         {
@@ -431,6 +432,10 @@ internal class Program
                 {
                     try
                     {
+                        // Determine the word being completed (the text after the last space)
+                        string wordBeingCompleted = parts.Length > 0 ? parts[^1] : "";
+                        string previousWord = parts.Length > 1 ? parts[^2] : "";
+
                         var p = new Process
                         {
                             StartInfo = new ProcessStartInfo
@@ -441,32 +446,58 @@ internal class Program
                             }
                         };
 
+                        // Pass the full command line and cursor byte position only to the completer process.
+                        p.StartInfo.Environment["COMP_LINE"] = text;
+                        p.StartInfo.Environment["COMP_POINT"] = Encoding.UTF8.GetByteCount(text).ToString();
+
+                        // Pass argv[1]=command name, argv[2]=word being completed, argv[3]=previous word (or empty)
+                        p.StartInfo.ArgumentList.Add(current);
+                        p.StartInfo.ArgumentList.Add(wordBeingCompleted);
+                        p.StartInfo.ArgumentList.Add(previousWord);
+
                         p.Start();
                         string output = p.StandardOutput.ReadToEnd();
                         p.WaitForExit();
 
-                        var lines = output.Split('\n', StringSplitOptions.RemoveEmptyEntries);
+                        var lines = output.Split('\n', StringSplitOptions.RemoveEmptyEntries)
+                            .Select(l => l.Trim())
+                            .Where(l => !string.IsNullOrEmpty(l))
+                            .OrderBy(l => l, StringComparer.Ordinal)
+                            .ToArray();
                         if (lines.Length == 0)
                         {
                             // No candidates: ring bell and leave input unchanged
+                            lastCompleterPrefix = null;
                             Console.Write("\x07");
                             return Array.Empty<string>();
                         }
 
                         if (lines.Length == 1)
-                            return new[] { lines[0].Trim() + " " };
+                        {
+                            lastCompleterPrefix = null;
+                            return new[] { lines[0] + " " };
+                        }
 
                         if (lines.Length > 1)
                         {
-                            // Multiple candidates: print them and leave input unchanged
+                            // Multiple candidates: first TAB rings the bell, second TAB prints them.
+                            if (lastCompleterPrefix != text)
+                            {
+                                lastCompleterPrefix = text;
+                                Console.Write("\x07");
+                                return Array.Empty<string>();
+                            }
+
                             Console.WriteLine();
-                            Console.WriteLine(string.Join("  ", lines.Select(l => l.Trim())));
+                            Console.WriteLine(string.Join("  ", lines));
                             Console.Write("$ " + text);
+                            lastCompleterPrefix = null;
                         }
                     }
                     catch
                     {
                         // If script execution fails, ring the bell and leave input unchanged
+                        lastCompleterPrefix = null;
                         Console.Write("\x07");
                         return Array.Empty<string>();
                     }
