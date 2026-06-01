@@ -299,6 +299,11 @@ internal class Program
                     string cmdName = ExpandParameters(parts[3]);
                     CompletionSpecs[cmdName] = scriptPath;
                 }
+                else if (parts.Length > 2 && parts[1] == "-r")
+                {
+                    string completeName = ExpandParameters(parts[2]);
+                    CompletionSpecs.Remove(completeName);
+                }
                 else if (parts.Length > 2 && parts[1] == "-p")
                 {
                     string completeName = ExpandParameters(parts[2]);
@@ -480,6 +485,16 @@ internal class Program
 
                         if (lines.Length > 1)
                         {
+                            string lcp = LCP(lines);
+
+                            // If the candidates share a prefix longer than what the user typed,
+                            // complete to that LCP immediately and wait for further input.
+                            if (lcp.Length > wordBeingCompleted.Length)
+                            {
+                                lastCompleterPrefix = null;
+                                return new[] { lcp };
+                            }
+
                             // Multiple candidates: first TAB rings the bell, second TAB prints them.
                             if (lastCompleterPrefix != text)
                             {
@@ -542,10 +557,14 @@ internal class Program
                         // ReadLine replaces the current word (after last separator) with this value.
                         return new[] { completedArg + " " };
                     }
+
+                    // No unique match: ring the bell and leave the line unchanged.
+                    Console.Write("\x07");
                 }
                 catch
                 {
-                    // If directory enumeration fails, fall through silently
+                    // If directory enumeration fails, ring the bell and leave the line unchanged.
+                    Console.Write("\x07");
                 }
 
                 return Array.Empty<string>();
@@ -1284,6 +1303,10 @@ internal class Program
                 if (expandedList.Count > 3 && expandedList[1] == "-C")
                 {
                     CompletionSpecs[expandedList[3]] = expandedList[2];
+                }
+                else if (expandedList.Count > 2 && expandedList[1] == "-r")
+                {
+                    CompletionSpecs.Remove(expandedList[2]);
                 }
                 else if (expandedList.Count > 2 && expandedList[1] == "-p")
                 {
