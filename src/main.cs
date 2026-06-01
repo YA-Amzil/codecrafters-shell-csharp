@@ -10,7 +10,7 @@ internal class Program
 
     #region Builtins
 
-    private static readonly string[] Builtins = { "echo", "exit", "type", "pwd", "cd", "history", "declare", "complete" };
+    private static readonly string[] Builtins = { "echo", "exit", "type", "pwd", "cd", "history", "declare", "complete", "jobs" };
 
     private static readonly List<string> CommandHistory = new();
     private static int HistoryAppendCursor = 0;
@@ -313,6 +313,10 @@ internal class Program
                         output.WriteLine($"complete: {completeName}: no completion specification");
                 }
                 break;
+
+            case "jobs":
+                // Empty implementation for now; later stages will list background jobs.
+                break;
         }
     }
 
@@ -399,7 +403,7 @@ internal class Program
     private class BuiltinAutoComplete : IAutoCompleteHandler
     {
         public char[] Separators { get; set; } = new[] { ' ' };
-        private static readonly string[] AutoBuiltins = { "echo", "exit", "history", "declare", "complete" };
+        private static readonly string[] AutoBuiltins = { "echo", "exit", "history", "declare", "complete", "jobs" };
 
         private string? lastPrefix = null;
         private string? lastCompleterPrefix = null;
@@ -1122,8 +1126,10 @@ internal class Program
 
     private static void Main()
     {
-        // Enable TAB autocompletion only when input is not redirected (interactive)
-        if (!Console.IsInputRedirected)
+        bool useReadLine = !Console.IsInputRedirected && !Console.IsOutputRedirected && !Console.IsErrorRedirected;
+
+        // Enable TAB autocompletion only in fully interactive terminals.
+        if (useReadLine)
             ReadLine.ReadLine.Context.AutoCompletionHandler = new BuiltinAutoComplete();
 
         // Load history from HISTFILE on startup
@@ -1133,18 +1139,15 @@ internal class Program
 
         while (true)
         {
-            Console.Write("$ ");
             string? input;
-            if (Console.IsInputRedirected)
+            if (useReadLine)
             {
-                // When tests pipe commands into stdin, ReadLine echoes the input back
-                // which causes duplicated lines in test output. Use Console.ReadLine
-                // to avoid that behavior in non-interactive mode.
-                input = Console.ReadLine();
+                input = ReadLine.ReadLine.Read("$ ");
             }
             else
             {
-                input = ReadLine.ReadLine.Read("");
+                Console.Write("$ ");
+                input = Console.ReadLine();
             }
             if (input == null)
                 break;
@@ -1293,6 +1296,12 @@ internal class Program
             }
 
             if (cmd == "declare")
+            {
+                RunBuiltinToWriter(expandedList.ToArray(), Console.Out);
+                continue;
+            }
+
+            if (cmd == "jobs")
             {
                 RunBuiltinToWriter(expandedList.ToArray(), Console.Out);
                 continue;
