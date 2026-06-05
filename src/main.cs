@@ -16,6 +16,31 @@ internal class Program
     private static int HistoryAppendCursor = 0;
     private static readonly Dictionary<string, string> ShellVariables = new();
     private static readonly Dictionary<string, string> CompletionSpecs = new();
+    private static int NextBackgroundJobNumber = 1;
+    private static readonly List<BackgroundJob> BackgroundJobs = new();
+
+    private sealed class BackgroundJob
+    {
+        public int JobNumber { get; init; }
+        public int ProcessId { get; init; }
+        public string Command { get; init; } = string.Empty;
+        public string Status { get; init; } = "Running";
+    }
+
+    private static void WriteJobs(TextWriter output)
+    {
+        var runningJobs = BackgroundJobs
+            .Where(job => job.Status == "Running")
+            .OrderBy(job => job.JobNumber)
+            .ToList();
+
+        for (int i = 0; i < runningJobs.Count; i++)
+        {
+            char marker = i == runningJobs.Count - 1 ? '+' : i == runningJobs.Count - 2 ? '-' : ' ';
+            var job = runningJobs[i];
+            output.WriteLine($"[{job.JobNumber}]{marker}  {job.Status.PadRight(24)}{job.Command}");
+        }
+    }
 
     private static bool IsBuiltin(string cmd) => Builtins.Contains(cmd);
 
@@ -280,6 +305,10 @@ internal class Program
                     output.WriteLine($"{target}: not found");
                 break;
 
+            case "jobs":
+                WriteJobs(output);
+                break;
+
             case "history":
                 HandleHistoryBuiltin(parts, output);
                 break;
@@ -314,9 +343,6 @@ internal class Program
                 }
                 break;
 
-            case "jobs":
-                // Empty implementation for now; later stages will list background jobs.
-                break;
         }
     }
 
@@ -786,7 +812,7 @@ internal class Program
     private static string ShellEscape(string s) =>
         "'" + s.Replace("'", "'\\''") + "'";
 
-    private static void ExecuteExternalProgram(string cmd, string[] args, RedirectionInfo? redirect)
+    private static void ExecuteExternalProgram(string cmd, string[] args, RedirectionInfo? redirect, bool background = false, string? originalCommand = null)
     {
         string? execPath = FindExecutableInPath(cmd);
         if (execPath == null)
@@ -828,6 +854,24 @@ internal class Program
             p.StartInfo.ArgumentList.Add(sb.ToString());
 
             p.Start();
+
+            if (background)
+            {
+                int jobNumber = NextBackgroundJobNumber++;
+                BackgroundJobs.Add(new BackgroundJob
+                {
+                    JobNumber = jobNumber,
+                    ProcessId = p.Id,
+                    Command = string.IsNullOrWhiteSpace(originalCommand)
+                        ? string.Join(" ", new[] { cmd }.Concat(args)) + " &"
+                        : originalCommand,
+                    Status = "Running"
+                });
+
+                Console.WriteLine($"[{jobNumber}] {p.Id}");
+                return;
+            }
+
             p.WaitForExit();
         }
         catch
@@ -1191,6 +1235,14 @@ internal class Program
             if (parts.Length == 0)
                 continue;
 
+            bool runInBackground = parts[^1] == "&";
+            if (runInBackground)
+            {
+                parts = parts[..^1];
+                if (parts.Length == 0)
+                    continue;
+            }
+
             var (cleaned, redirect) = ParseRedirection(parts);
             if (cleaned.Length == 0)
                 continue;
@@ -1332,7 +1384,7 @@ internal class Program
             // EXTERNAL COMMAND
             // -------------------------
             var externalArgs = expandedList.Skip(1).ToArray();
-            ExecuteExternalProgram(cmd, externalArgs, redirect);
+            ExecuteExternalProgram(cmd, externalArgs, redirect, runInBackground, input.Trim());
         }
     }
 
