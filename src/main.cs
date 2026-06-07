@@ -24,22 +24,53 @@ internal class Program
         public int JobNumber { get; init; }
         public int ProcessId { get; init; }
         public string Command { get; init; } = string.Empty;
-        public string Status { get; init; } = "Running";
+        public string Status { get; set; } = "Running";
+        public Process? Process { get; init; }
     }
 
     private static void WriteJobs(TextWriter output)
     {
-        var runningJobs = BackgroundJobs
-            .Where(job => job.Status == "Running")
+        // First pass: check each running job to see if it has exited
+        foreach (var job in BackgroundJobs.Where(j => j.Status == "Running"))
+        {
+            try
+            {
+                if (job.Process != null && job.Process.HasExited)
+                    job.Status = "Done";
+            }
+            catch
+            {
+                // If we can't check, leave as Running
+            }
+        }
+
+        var visibleJobs = BackgroundJobs
+            .Where(job => job.Status == "Running" || job.Status == "Done")
             .OrderBy(job => job.JobNumber)
             .ToList();
 
-        for (int i = 0; i < runningJobs.Count; i++)
+        for (int i = 0; i < visibleJobs.Count; i++)
         {
-            char marker = i == runningJobs.Count - 1 ? '+' : i == runningJobs.Count - 2 ? '-' : ' ';
-            var job = runningJobs[i];
-            output.WriteLine($"[{job.JobNumber}]{marker}  {job.Status.PadRight(24)}{job.Command}");
+            var job = visibleJobs[i];
+            // Marker: last job gets '+', second-to-last gets '-', others get ' '
+            char marker = i == visibleJobs.Count - 1 ? '+' : i == visibleJobs.Count - 2 ? '-' : ' ';
+
+            if (job.Status == "Done")
+            {
+                // Done jobs: strip trailing ' &' from command display
+                string displayCmd = job.Command;
+                if (displayCmd.EndsWith(" &"))
+                    displayCmd = displayCmd[..^2];
+                output.WriteLine($"[{job.JobNumber}]{marker}  {"Done".PadRight(24)}{displayCmd}");
+            }
+            else
+            {
+                output.WriteLine($"[{job.JobNumber}]{marker}  {job.Status.PadRight(24)}{job.Command}");
+            }
         }
+
+        // Second pass: remove Done jobs from the table
+        BackgroundJobs.RemoveAll(job => job.Status == "Done");
     }
 
     private static bool IsBuiltin(string cmd) => Builtins.Contains(cmd);
@@ -865,7 +896,8 @@ internal class Program
                     Command = string.IsNullOrWhiteSpace(originalCommand)
                         ? string.Join(" ", new[] { cmd }.Concat(args)) + " &"
                         : originalCommand,
-                    Status = "Running"
+                    Status = "Running",
+                    Process = p
                 });
 
                 Console.WriteLine($"[{jobNumber}] {p.Id}");
