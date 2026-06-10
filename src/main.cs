@@ -16,8 +16,18 @@ internal class Program
     private static int HistoryAppendCursor = 0;
     private static readonly Dictionary<string, string> ShellVariables = new();
     private static readonly Dictionary<string, string> CompletionSpecs = new();
-    private static int NextBackgroundJobNumber = 1;
     private static readonly List<BackgroundJob> BackgroundJobs = new();
+
+    // Returns the smallest positive integer not already in use as a job number.
+    // This recycles numbers when jobs finish: if jobs [1] and [3] exist the next
+    // job gets [2], and when the table is empty the next job gets [1].
+    private static int AllocateJobNumber()
+    {
+        var used = new HashSet<int>(BackgroundJobs.Select(j => j.JobNumber));
+        int n = 1;
+        while (used.Contains(n)) n++;
+        return n;
+    }
 
     private sealed class BackgroundJob
     {
@@ -950,7 +960,7 @@ internal class Program
 
             if (background)
             {
-                int jobNumber = NextBackgroundJobNumber++;
+                int jobNumber = AllocateJobNumber();
                 BackgroundJobs.Add(new BackgroundJob
                 {
                     JobNumber = jobNumber,
