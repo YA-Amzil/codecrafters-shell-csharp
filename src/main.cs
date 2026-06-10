@@ -25,12 +25,27 @@ internal class Program
         public int ProcessId { get; init; }
         public string Command { get; init; } = string.Empty;
         public string Status { get; set; } = "Running";
+        // Stored so we can poll HasExited without a waitpid-style blocking call
         public Process? Process { get; init; }
     }
 
-    private static void WriteJobs(TextWriter output)
+    // -----------------------------------------------------------------------
+    // ReapCompletedJobs
+    // Shared reaping logic used in two places:
+    //   1. Before each prompt  (automatic reaping)
+    //   2. Inside WriteJobs    (jobs builtin)
+    //
+    // Steps:
+    //   a) Poll every Running job via Process.HasExited (non-blocking).
+    //      If exited, flip Status to "Done".
+    //   b) Print a "Done" line for every newly-done job, with correct +/- marker.
+    //      The marker is calculated over *all* still-visible jobs (Running + Done)
+    //      so it matches what bash would show.
+    //   c) Remove all Done jobs from the table so they never appear again.
+    // -----------------------------------------------------------------------
+    private static void ReapCompletedJobs(TextWriter output)
     {
-        // First pass: check each running job to see if it has exited
+        // --- Step a: poll for exits ---
         foreach (var job in BackgroundJobs.Where(j => j.Status == "Running"))
         {
             try
@@ -40,27 +55,74 @@ internal class Program
             }
             catch
             {
-                // If we can't check, leave as Running
+                // If we can't check (e.g. process handle closed), leave as Running
             }
         }
 
-        var visibleJobs = BackgroundJobs
-            .Where(job => job.Status == "Running" || job.Status == "Done")
-            .OrderBy(job => job.JobNumber)
+        // --- Step b: print Done lines ---
+        // Build the full ordered list (Running + Done) so we can assign markers
+        // the same way the jobs builtin does.
+        var allVisible = BackgroundJobs
+            .Where(j => j.Status == "Running" || j.Status == "Done")
+            .OrderBy(j => j.JobNumber)
             .ToList();
 
-        for (int i = 0; i < visibleJobs.Count; i++)
+        var doneJobs = allVisible.Where(j => j.Status == "Done").ToList();
+
+        foreach (var job in doneJobs)
         {
-            var job = visibleJobs[i];
-            // Marker: last job gets '+', second-to-last gets '-', others get ' '
-            char marker = i == visibleJobs.Count - 1 ? '+' : i == visibleJobs.Count - 2 ? '-' : ' ';
+            int idx = allVisible.IndexOf(job);
+            // Last visible job → '+', second-to-last → '-', others → ' '
+            char marker = idx == allVisible.Count - 1 ? '+' : idx == allVisible.Count - 2 ? '-' : ' ';
+
+            // Strip the trailing " &" that is stored in the command string
+            string displayCmd = job.Command;
+            if (displayCmd.EndsWith(" &"))
+                displayCmd = displayCmd[..^2];
+
+            output.WriteLine($"[{job.JobNumber}]{marker}  {"Done".PadRight(24)}{displayCmd}");
+        }
+
+        // --- Step c: remove reaped jobs ---
+        BackgroundJobs.RemoveAll(j => j.Status == "Done");
+    }
+
+    // -----------------------------------------------------------------------
+    // WriteJobs  (jobs builtin)
+    // Polls for completed jobs, then displays all jobs in job-number order:
+    // Running entries first, Done entries after. Both share the same marker
+    // calculation so the +/- reflects the full visible list.
+    // Done jobs are removed from the table after being displayed so they
+    // never appear in a subsequent jobs call.
+    // -----------------------------------------------------------------------
+    private static void WriteJobs(TextWriter output)
+    {
+        // Poll: flip any exited Running jobs to Done (no output yet)
+        foreach (var job in BackgroundJobs.Where(j => j.Status == "Running"))
+        {
+            try
+            {
+                if (job.Process != null && job.Process.HasExited)
+                    job.Status = "Done";
+            }
+            catch { }
+        }
+
+        // Build the full ordered list (Running + Done) for marker calculation
+        var allVisible = BackgroundJobs
+            .Where(j => j.Status == "Running" || j.Status == "Done")
+            .OrderBy(j => j.JobNumber)
+            .ToList();
+
+        // Print all jobs in job-number order (Running and Done interleaved)
+        foreach (var job in allVisible)
+        {
+            int idx = allVisible.IndexOf(job);
+            char marker = idx == allVisible.Count - 1 ? '+' : idx == allVisible.Count - 2 ? '-' : ' ';
 
             if (job.Status == "Done")
             {
-                // Done jobs: strip trailing ' &' from command display
-                string displayCmd = job.Command;
-                if (displayCmd.EndsWith(" &"))
-                    displayCmd = displayCmd[..^2];
+                string displayCmd = job.Command.EndsWith(" &") ? job.Command[..^2] : job.Command;
                 output.WriteLine($"[{job.JobNumber}]{marker}  {"Done".PadRight(24)}{displayCmd}");
             }
             else
@@ -69,8 +131,8 @@ internal class Program
             }
         }
 
-        // Second pass: remove Done jobs from the table
-        BackgroundJobs.RemoveAll(job => job.Status == "Done");
+        // Remove Done jobs from the table
+        BackgroundJobs.RemoveAll(j => j.Status == "Done");
     }
 
     private static bool IsBuiltin(string cmd) => Builtins.Contains(cmd);
@@ -897,6 +959,7 @@ internal class Program
                         ? string.Join(" ", new[] { cmd }.Concat(args)) + " &"
                         : originalCommand,
                     Status = "Running",
+                    // Store the Process reference so ReapCompletedJobs can poll it later
                     Process = p
                 });
 
@@ -1215,6 +1278,15 @@ internal class Program
 
         while (true)
         {
+            // -----------------------------------------------------------------
+            // Automatic job reaping: check for completed background jobs before
+            // every prompt. Done lines are printed here so they appear between
+            // the previous command's output and the next prompt, exactly as bash
+            // does. Jobs reaped here are removed from the table and will not
+            // appear again in the jobs builtin.
+            // -----------------------------------------------------------------
+            ReapCompletedJobs(Console.Out);
+
             string? input;
             if (useReadLine)
             {
