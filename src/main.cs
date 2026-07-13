@@ -657,41 +657,80 @@ internal class Program
 
                 try
                 {
-                    // Determine the directory to search and the name prefix
+                    // Split the typed word into "directory to list" + "name prefix"
+                    // + the exact directory text the user typed (displayPrefix),
+                    // splitting manually on the last '/' so a trailing slash like
+                    // "bee/" is handled correctly on every platform.
+                    //   "bee/"    -> searchDir "bee", namePrefix "",   displayPrefix "bee/"
+                    //   "bee/do"  -> searchDir "bee", namePrefix "do", displayPrefix "bee/"
+                    //   "be"      -> searchDir ".",   namePrefix "be", displayPrefix ""
                     string searchDir;
                     string namePrefix;
+                    string displayPrefix;
 
-                    if (string.IsNullOrEmpty(filePrefix))
+                    int lastSlash = filePrefix.LastIndexOf('/');
+                    if (lastSlash >= 0)
                     {
-                        searchDir = ".";
-                        namePrefix = "";
+                        string dir = filePrefix.Substring(0, lastSlash);
+                        searchDir = string.IsNullOrEmpty(dir) ? "/" : dir;
+                        namePrefix = filePrefix.Substring(lastSlash + 1);
+                        displayPrefix = filePrefix.Substring(0, lastSlash + 1);
                     }
                     else
                     {
-                        string? dirPart = Path.GetDirectoryName(filePrefix);
-                        searchDir = string.IsNullOrEmpty(dirPart) ? "." : dirPart;
-                        namePrefix = Path.GetFileName(filePrefix);
+                        searchDir = ".";
+                        namePrefix = filePrefix;
+                        displayPrefix = "";
+                    }
+
+                    if (!Directory.Exists(searchDir))
+                    {
+                        Console.Write("\x07");
+                        return Array.Empty<string>();
                     }
 
                     var matches = Directory.GetFileSystemEntries(searchDir)
                         .Select(e => Path.GetFileName(e)!)
                         .Where(name => name.StartsWith(namePrefix, StringComparison.Ordinal))
-                        .OrderBy(name => name)
+                        .OrderBy(name => name, StringComparer.Ordinal)
                         .ToArray();
 
                     if (matches.Length == 1)
                     {
-                        // Build the completed argument, preserving any directory prefix
-                        string completedArg = (searchDir == ".")
-                            ? matches[0]
-                            : Path.Combine(searchDir, matches[0]);
+                        // Build the completion cycle by descending as far as single-entry
+                        // directories allow. Because tonerdo/readline does NOT re-query on a
+                        // second Tab (it cycles the cached list), we return each descent level
+                        // as a successive cycle entry: ["cow/", "cow/pig/", ...].
+                        var chain = new List<string>();
 
-                        // Return only the completed filename + trailing space.
-                        // ReadLine replaces the current word (after last separator) with this value.
-                        return new[] { completedArg + " " };
+                        string curDisplay = displayPrefix + matches[0];   // "cow"
+                        string curSearch = Path.Combine(searchDir, matches[0]);
+
+                        string firstFull = Path.Combine(searchDir, matches[0]);
+                        string firstSuffix = Directory.Exists(firstFull) ? "/" : " ";
+                        chain.Add(curDisplay + firstSuffix);              // "cow/"
+
+                        // Keep descending while the current level is a directory containing
+                        // exactly one entry.
+                        while (Directory.Exists(curSearch))
+                        {
+                            string[] inner;
+                            try { inner = Directory.GetFileSystemEntries(curSearch); }
+                            catch { break; }
+
+                            if (inner.Length != 1) break;
+
+                            string innerName = Path.GetFileName(inner[0])!;
+                            curDisplay = curDisplay + "/" + innerName;    // "cow/pig"
+                            curSearch = Path.Combine(curSearch, innerName);
+                            string innerSuffix = Directory.Exists(curSearch) ? "/" : " ";
+                            chain.Add(curDisplay + innerSuffix);          // "cow/pig/"
+                        }
+
+                        return chain.ToArray();
                     }
 
-                    // No unique match: ring the bell and leave the line unchanged.
+                    // No unique match: ring the bell, leave the line unchanged.
                     Console.Write("\x07");
                 }
                 catch
