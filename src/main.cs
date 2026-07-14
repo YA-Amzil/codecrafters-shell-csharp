@@ -18,9 +18,6 @@ internal class Program
     private static readonly Dictionary<string, string> CompletionSpecs = new();
     private static readonly List<BackgroundJob> BackgroundJobs = new();
 
-    // Returns the smallest positive integer not already in use as a job number.
-    // This recycles numbers when jobs finish: if jobs [1] and [3] exist the next
-    // job gets [2], and when the table is empty the next job gets [1].
     private static int AllocateJobNumber()
     {
         var used = new HashSet<int>(BackgroundJobs.Select(j => j.JobNumber));
@@ -35,27 +32,11 @@ internal class Program
         public int ProcessId { get; init; }
         public string Command { get; init; } = string.Empty;
         public string Status { get; set; } = "Running";
-        // Stored so we can poll HasExited without a waitpid-style blocking call
         public Process? Process { get; init; }
     }
 
-    // -----------------------------------------------------------------------
-    // ReapCompletedJobs
-    // Shared reaping logic used in two places:
-    //   1. Before each prompt  (automatic reaping)
-    //   2. Inside WriteJobs    (jobs builtin)
-    //
-    // Steps:
-    //   a) Poll every Running job via Process.HasExited (non-blocking).
-    //      If exited, flip Status to "Done".
-    //   b) Print a "Done" line for every newly-done job, with correct +/- marker.
-    //      The marker is calculated over *all* still-visible jobs (Running + Done)
-    //      so it matches what bash would show.
-    //   c) Remove all Done jobs from the table so they never appear again.
-    // -----------------------------------------------------------------------
     private static void ReapCompletedJobs(TextWriter output)
     {
-        // --- Step a: poll for exits ---
         foreach (var job in BackgroundJobs.Where(j => j.Status == "Running"))
         {
             try
@@ -65,13 +46,9 @@ internal class Program
             }
             catch
             {
-                // If we can't check (e.g. process handle closed), leave as Running
             }
         }
 
-        // --- Step b: print Done lines ---
-        // Build the full ordered list (Running + Done) so we can assign markers
-        // the same way the jobs builtin does.
         var allVisible = BackgroundJobs
             .Where(j => j.Status == "Running" || j.Status == "Done")
             .OrderBy(j => j.JobNumber)
@@ -82,10 +59,8 @@ internal class Program
         foreach (var job in doneJobs)
         {
             int idx = allVisible.IndexOf(job);
-            // Last visible job → '+', second-to-last → '-', others → ' '
             char marker = idx == allVisible.Count - 1 ? '+' : idx == allVisible.Count - 2 ? '-' : ' ';
 
-            // Strip the trailing " &" that is stored in the command string
             string displayCmd = job.Command;
             if (displayCmd.EndsWith(" &"))
                 displayCmd = displayCmd[..^2];
@@ -93,21 +68,11 @@ internal class Program
             output.WriteLine($"[{job.JobNumber}]{marker}  {"Done".PadRight(24)}{displayCmd}");
         }
 
-        // --- Step c: remove reaped jobs ---
         BackgroundJobs.RemoveAll(j => j.Status == "Done");
     }
 
-    // -----------------------------------------------------------------------
-    // WriteJobs  (jobs builtin)
-    // Polls for completed jobs, then displays all jobs in job-number order:
-    // Running entries first, Done entries after. Both share the same marker
-    // calculation so the +/- reflects the full visible list.
-    // Done jobs are removed from the table after being displayed so they
-    // never appear in a subsequent jobs call.
-    // -----------------------------------------------------------------------
     private static void WriteJobs(TextWriter output)
     {
-        // Poll: flip any exited Running jobs to Done (no output yet)
         foreach (var job in BackgroundJobs.Where(j => j.Status == "Running"))
         {
             try
@@ -118,13 +83,11 @@ internal class Program
             catch { }
         }
 
-        // Build the full ordered list (Running + Done) for marker calculation
         var allVisible = BackgroundJobs
             .Where(j => j.Status == "Running" || j.Status == "Done")
             .OrderBy(j => j.JobNumber)
             .ToList();
 
-        // Print all jobs in job-number order (Running and Done interleaved)
         foreach (var job in allVisible)
         {
             int idx = allVisible.IndexOf(job);
@@ -141,7 +104,6 @@ internal class Program
             }
         }
 
-        // Remove Done jobs from the table
         BackgroundJobs.RemoveAll(j => j.Status == "Done");
     }
 
@@ -152,11 +114,9 @@ internal class Program
         if (string.IsNullOrEmpty(name))
             return false;
 
-        // First character must be a letter or underscore
         if (!char.IsLetter(name[0]) && name[0] != '_')
             return false;
 
-        // Rest must be letters, digits, or underscores
         for (int i = 1; i < name.Length; i++)
         {
             if (!char.IsLetterOrDigit(name[i]) && name[i] != '_')
@@ -166,7 +126,6 @@ internal class Program
         return true;
     }
 
-    // Expand variables inside a single token. Supports $NAME and ${NAME} forms.
     private static string ExpandToken(string token)
     {
         if (string.IsNullOrEmpty(token)) return token;
@@ -181,10 +140,8 @@ internal class Program
                 continue;
             }
 
-            // Found '$'
             if (i + 1 >= token.Length)
             {
-                // Trailing $, keep as literal
                 sb.Append('$');
                 continue;
             }
@@ -192,26 +149,22 @@ internal class Program
             char next = token[i + 1];
             if (next == '{')
             {
-                // ${NAME}
                 int end = token.IndexOf('}', i + 2);
                 if (end == -1)
                 {
-                    // No closing brace, treat literally
                     sb.Append("${");
-                    i += 1; // move past '{'
+                    i += 1;
                     continue;
                 }
 
                 string name = token.Substring(i + 2, end - (i + 2));
                 if (ShellVariables.TryGetValue(name, out var val))
                     sb.Append(val);
-                // else append nothing (unset -> empty)
 
-                i = end; // move past '}'
+                i = end;
                 continue;
             }
 
-            // $NAME where NAME starts with letter or underscore
             if (char.IsLetter(next) || next == '_')
             {
                 int j = i + 1;
@@ -219,20 +172,17 @@ internal class Program
                 string name = token.Substring(i + 1, j - (i + 1));
                 if (ShellVariables.TryGetValue(name, out var val))
                     sb.Append(val);
-                // else append nothing
 
                 i = j - 1;
                 continue;
             }
 
-            // Not a valid variable name, leave the dollar sign as-is
             sb.Append('$');
         }
 
         return sb.ToString();
     }
 
-    // Expand an array of tokens. Drops any tokens that expand to empty strings.
     private static List<string> ExpandWords(string[] tokens)
     {
         var result = new List<string>();
@@ -275,17 +225,14 @@ internal class Program
                     continue;
                 }
 
-                // Check if next character starts a valid identifier
                 int j = i + 1;
                 if (char.IsLetter(token[j]) || token[j] == '_')
                 {
-                    // Extract the variable name
                     while (j < token.Length && (char.IsLetterOrDigit(token[j]) || token[j] == '_'))
                         j++;
 
                     string varName = token.Substring(i + 1, j - i - 1);
 
-                    // Look up the variable
                     if (ShellVariables.TryGetValue(varName, out var value))
                     {
                         result.Append(value);
@@ -309,10 +256,7 @@ internal class Program
 
         foreach (var p in parts)
         {
-            // Expand parameters in the token. Do NOT perform additional word-splitting
-            // here so that quoted tokens that contain spaces remain a single argument.
             string expanded = ExpandParameters(p);
-            // If expansion yields an empty string, drop the resulting word
             if (!string.IsNullOrEmpty(expanded))
                 result.Add(expanded);
         }
@@ -322,7 +266,6 @@ internal class Program
 
     private static void AddToHistory(string entry)
     {
-        // Never store empty lines
         if (string.IsNullOrWhiteSpace(entry))
             return;
 
@@ -421,7 +364,6 @@ internal class Program
                 break;
 
             case "cd":
-                // cd inside pipelines does nothing
                 break;
 
             case "complete":
@@ -481,7 +423,6 @@ internal class Program
 
     private static void HandleDeclareBuiltin(string[] parts, TextWriter output)
     {
-        // Handle declare -p variable_name
         if (parts.Length > 2 && parts[1] == "-p")
         {
             string varName = ExpandParameters(parts[2]);
@@ -496,7 +437,6 @@ internal class Program
             return;
         }
 
-        // Handle declare NAME=VALUE
         if (parts.Length > 1)
         {
             string arg = parts[1];
@@ -506,10 +446,8 @@ internal class Program
                 string varName = arg.Substring(0, eqIdx);
                 string varValue = arg.Substring(eqIdx + 1);
 
-                // Expand parameters in the value
                 varValue = ExpandParameters(varValue);
 
-                // Validate variable name
                 if (!IsValidIdentifier(varName))
                 {
                     output.WriteLine($"declare: `{arg}': not a valid identifier");
@@ -535,6 +473,7 @@ internal class Program
         private static readonly string[] AutoBuiltins = { "echo", "exit", "history", "declare", "complete", "jobs" };
 
         private string? lastPrefix = null;
+        private string? lastFilePrefix = null;
         private string? lastCompleterPrefix = null;
 
         private static string LCP(string[] arr)
@@ -561,16 +500,14 @@ internal class Program
             string current = parts[0];
 
             // ---------------------------------------------------------------
-            // Argument completion (parts.Length > 1): complete filenames
+            // Argument completion (parts.Length > 1): files and directories
             // ---------------------------------------------------------------
             if (parts.Length > 1)
             {
-                // Check if a completer script is registered for this command
                 if (CompletionSpecs.TryGetValue(current, out var completerScript))
                 {
                     try
                     {
-                        // Determine the word being completed (the text after the last space)
                         string wordBeingCompleted = parts.Length > 0 ? parts[^1] : "";
                         string previousWord = parts.Length > 1 ? parts[^2] : "";
 
@@ -584,11 +521,9 @@ internal class Program
                             }
                         };
 
-                        // Pass the full command line and cursor byte position only to the completer process.
                         p.StartInfo.Environment["COMP_LINE"] = text;
                         p.StartInfo.Environment["COMP_POINT"] = Encoding.UTF8.GetByteCount(text).ToString();
 
-                        // Pass argv[1]=command name, argv[2]=word being completed, argv[3]=previous word (or empty)
                         p.StartInfo.ArgumentList.Add(current);
                         p.StartInfo.ArgumentList.Add(wordBeingCompleted);
                         p.StartInfo.ArgumentList.Add(previousWord);
@@ -604,7 +539,6 @@ internal class Program
                             .ToArray();
                         if (lines.Length == 0)
                         {
-                            // No candidates: ring bell and leave input unchanged
                             lastCompleterPrefix = null;
                             Console.Write("\x07");
                             return Array.Empty<string>();
@@ -620,15 +554,12 @@ internal class Program
                         {
                             string lcp = LCP(lines);
 
-                            // If the candidates share a prefix longer than what the user typed,
-                            // complete to that LCP immediately and wait for further input.
                             if (lcp.Length > wordBeingCompleted.Length)
                             {
                                 lastCompleterPrefix = null;
                                 return new[] { lcp };
                             }
 
-                            // Multiple candidates: first TAB rings the bell, second TAB prints them.
                             if (lastCompleterPrefix != text)
                             {
                                 lastCompleterPrefix = text;
@@ -644,7 +575,6 @@ internal class Program
                     }
                     catch
                     {
-                        // If script execution fails, ring the bell and leave input unchanged
                         lastCompleterPrefix = null;
                         Console.Write("\x07");
                         return Array.Empty<string>();
@@ -653,17 +583,15 @@ internal class Program
                     return Array.Empty<string>();
                 }
 
-                string filePrefix = parts[^1]; // partial filename typed so far
+                string filePrefix = parts[^1]; // partial path typed so far
 
                 try
                 {
                     // Split the typed word into "directory to list" + "name prefix"
-                    // + the exact directory text the user typed (displayPrefix),
-                    // splitting manually on the last '/' so a trailing slash like
-                    // "bee/" is handled correctly on every platform.
-                    //   "bee/"    -> searchDir "bee", namePrefix "",   displayPrefix "bee/"
-                    //   "bee/do"  -> searchDir "bee", namePrefix "do", displayPrefix "bee/"
-                    //   "be"      -> searchDir ".",   namePrefix "be", displayPrefix ""
+                    // + the exact directory text the user typed (displayPrefix).
+                    //   "cow/"    -> searchDir "cow", namePrefix "",   displayPrefix "cow/"
+                    //   "cow/pi"  -> searchDir "cow", namePrefix "pi", displayPrefix "cow/"
+                    //   "co"      -> searchDir ".",   namePrefix "co", displayPrefix ""
                     string searchDir;
                     string namePrefix;
                     string displayPrefix;
@@ -685,6 +613,7 @@ internal class Program
 
                     if (!Directory.Exists(searchDir))
                     {
+                        lastFilePrefix = null;
                         Console.Write("\x07");
                         return Array.Empty<string>();
                     }
@@ -695,23 +624,28 @@ internal class Program
                         .OrderBy(name => name, StringComparer.Ordinal)
                         .ToArray();
 
+                    // ---------------------------------------------------------
+                    // Exactly one match: build the descent chain.
+                    //
+                    // The ReadLine library does NOT re-query this handler on a
+                    // second consecutive Tab -- it cycles the array returned by
+                    // the first Tab. So we return each descent level as a
+                    // successive cycle entry: ["cow/", "cow/pig/", ...].
+                    // ---------------------------------------------------------
                     if (matches.Length == 1)
                     {
-                        // Build the completion cycle by descending as far as single-entry
-                        // directories allow. Because tonerdo/readline does NOT re-query on a
-                        // second Tab (it cycles the cached list), we return each descent level
-                        // as a successive cycle entry: ["cow/", "cow/pig/", ...].
+                        lastFilePrefix = null;
+
                         var chain = new List<string>();
 
-                        string curDisplay = displayPrefix + matches[0];   // "cow"
+                        string curDisplay = displayPrefix + matches[0];
                         string curSearch = Path.Combine(searchDir, matches[0]);
 
-                        string firstFull = Path.Combine(searchDir, matches[0]);
-                        string firstSuffix = Directory.Exists(firstFull) ? "/" : " ";
-                        chain.Add(curDisplay + firstSuffix);              // "cow/"
+                        string firstSuffix = Directory.Exists(curSearch) ? "/" : " ";
+                        chain.Add(curDisplay + firstSuffix);
 
-                        // Keep descending while the current level is a directory containing
-                        // exactly one entry.
+                        // Keep descending while the current level is a directory
+                        // containing exactly one entry.
                         while (Directory.Exists(curSearch))
                         {
                             string[] inner;
@@ -721,21 +655,66 @@ internal class Program
                             if (inner.Length != 1) break;
 
                             string innerName = Path.GetFileName(inner[0])!;
-                            curDisplay = curDisplay + "/" + innerName;    // "cow/pig"
+                            curDisplay = curDisplay + "/" + innerName;
                             curSearch = Path.Combine(curSearch, innerName);
                             string innerSuffix = Directory.Exists(curSearch) ? "/" : " ";
-                            chain.Add(curDisplay + innerSuffix);          // "cow/pig/"
+                            chain.Add(curDisplay + innerSuffix);
                         }
 
                         return chain.ToArray();
                     }
 
-                    // No unique match: ring the bell, leave the line unchanged.
-                    Console.Write("\x07");
+                    // ---------------------------------------------------------
+                    // Zero matches: ring the bell, leave the line unchanged.
+                    // ---------------------------------------------------------
+                    if (matches.Length == 0)
+                    {
+                        lastFilePrefix = null;
+                        Console.Write("\x07");
+                        return Array.Empty<string>();
+                    }
+
+                    // ---------------------------------------------------------
+                    // Multiple matches.
+                    //
+                    // Returning an empty array keeps the library OUT of cycle
+                    // mode, so the next Tab calls this handler again -- which is
+                    // what lets the bell-then-list behaviour work.
+                    // ---------------------------------------------------------
+
+                    // Directories are displayed with a trailing '/', files bare.
+                    var display = matches
+                        .Select(m => Directory.Exists(Path.Combine(searchDir, m)) ? m + "/" : m)
+                        .ToArray();
+
+                    // If every candidate shares a longer common prefix than what
+                    // was typed, complete to that prefix first.
+                    string lcpName = LCP(matches);
+                    if (lcpName.Length > namePrefix.Length)
+                    {
+                        lastFilePrefix = null;
+                        return new[] { displayPrefix + lcpName };
+                    }
+
+                    // First TAB on this exact text: ring the bell only.
+                    if (lastFilePrefix != text)
+                    {
+                        lastFilePrefix = text;
+                        Console.Write("\x07");
+                        return Array.Empty<string>();
+                    }
+
+                    // Second TAB: list all matches, then redisplay the prompt
+                    // with the original input preserved.
+                    Console.WriteLine();
+                    Console.WriteLine(string.Join("  ", display));
+                    Console.Write("$ " + text);
+                    lastFilePrefix = null;
+                    return Array.Empty<string>();
                 }
                 catch
                 {
-                    // If directory enumeration fails, ring the bell and leave the line unchanged.
+                    lastFilePrefix = null;
                     Console.Write("\x07");
                 }
 
@@ -1008,7 +987,6 @@ internal class Program
                         ? string.Join(" ", new[] { cmd }.Concat(args)) + " &"
                         : originalCommand,
                     Status = "Running",
-                    // Store the Process reference so ReapCompletedJobs can poll it later
                     Process = p
                 });
 
@@ -1119,14 +1097,12 @@ internal class Program
 
             p.Start();
 
-            // Write builtin output into wc stdin
             using (var writer = new StreamWriter(p.StandardInput.BaseStream, new UTF8Encoding(false)))
             {
                 writer.AutoFlush = true;
                 RunBuiltinToWriter(left, writer);
             }
 
-            // Wait for wc to finish
             p.WaitForExit();
             return;
         }
@@ -1282,7 +1258,6 @@ internal class Program
                 continue;
             }
 
-            // Space ends token (only when not inside quotes)
             if (c == ' ' && !inSingle && !inDouble)
             {
                 if (current.Length > 0)
@@ -1294,11 +1269,9 @@ internal class Program
                 continue;
             }
 
-            // Normal character
             current.Append(c);
         }
 
-        // Add last token
         if (current.Length > 0)
             tokens.Add(current.ToString());
 
@@ -1316,24 +1289,15 @@ internal class Program
     {
         bool useReadLine = !Console.IsInputRedirected && !Console.IsOutputRedirected && !Console.IsErrorRedirected;
 
-        // Enable TAB autocompletion only in fully interactive terminals.
         if (useReadLine)
             ReadLine.ReadLine.Context.AutoCompletionHandler = new BuiltinAutoComplete();
 
-        // Load history from HISTFILE on startup
         string? histfile = Environment.GetEnvironmentVariable("HISTFILE");
         if (!string.IsNullOrEmpty(histfile) && File.Exists(histfile))
             LoadHistoryFromFile(histfile);
 
         while (true)
         {
-            // -----------------------------------------------------------------
-            // Automatic job reaping: check for completed background jobs before
-            // every prompt. Done lines are printed here so they appear between
-            // the previous command's output and the next prompt, exactly as bash
-            // does. Jobs reaped here are removed from the table and will not
-            // appear again in the jobs builtin.
-            // -----------------------------------------------------------------
             ReapCompletedJobs(Console.Out);
 
             string? input;
@@ -1352,12 +1316,8 @@ internal class Program
             if (string.IsNullOrWhiteSpace(input))
                 continue;
 
-            // Always add to history (including exit)
             AddToHistory(input);
 
-            // -------------------------
-            // PIPELINES
-            // -------------------------
             if (input.Contains("|"))
             {
                 var segments = input.Split('|');
@@ -1381,9 +1341,6 @@ internal class Program
                 continue;
             }
 
-            // -------------------------
-            // NORMAL COMMAND
-            // -------------------------
             var parts = ParseCommandLine(input);
             if (parts.Length == 0)
                 continue;
@@ -1400,7 +1357,6 @@ internal class Program
             if (cleaned.Length == 0)
                 continue;
 
-            // Expand redirection targets as they may contain parameters
             if (!string.IsNullOrEmpty(redirect.StdoutFile))
                 redirect.StdoutFile = ExpandParameters(redirect.StdoutFile);
             if (!string.IsNullOrEmpty(redirect.StderrFile))
@@ -1412,9 +1368,6 @@ internal class Program
 
             string cmd = expandedList[0];
 
-            // -------------------------
-            // EXIT (write history!)
-            // -------------------------
             if (cmd == "exit")
             {
                 if (!string.IsNullOrEmpty(histfile))
@@ -1423,9 +1376,6 @@ internal class Program
                 break;
             }
 
-            // -------------------------
-            // BUILTINS
-            // -------------------------
             if (cmd == "echo")
             {
                 string output = expandedList.Skip(1).Any() ? string.Join(" ", expandedList.Skip(1)) : "";
@@ -1533,9 +1483,6 @@ internal class Program
                 continue;
             }
 
-            // -------------------------
-            // EXTERNAL COMMAND
-            // -------------------------
             var externalArgs = expandedList.Skip(1).ToArray();
             ExecuteExternalProgram(cmd, externalArgs, redirect, runInBackground, input.Trim());
         }
